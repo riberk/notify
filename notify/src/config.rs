@@ -1,6 +1,6 @@
 //! Configuration types
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 /// Indicates whether only the provided directory or its sub-directories as well should be watched
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
@@ -123,3 +123,23 @@ impl Default for Config {
         }
     }
 }
+
+
+pub trait ShouldWatch {
+    fn should_watch(&mut self, path: &Path) -> bool;
+}
+
+impl<T: FnMut(&Path) -> bool> ShouldWatch for T {
+    fn should_watch(&mut self, path: &Path) -> bool {
+        self(path)
+    }
+}
+
+pub(crate) struct WatchFilter(Option<Box<dyn ShouldWatch + Send>>);
+
+impl ShouldWatch for WatchFilter {
+    fn should_watch(&mut self, path: &Path) -> bool {
+        self.0.as_mut().map(|filter| filter.should_watch(path)).unwrap_or_default()
+    }
+}
+
