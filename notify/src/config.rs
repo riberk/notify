@@ -1,6 +1,12 @@
 //! Configuration types
 
-use std::{path::Path, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::HashSet,
+    path::{Path, PathBuf},
+    rc::Rc,
+    time::Duration,
+};
 
 /// Indicates whether only the provided directory or its sub-directories as well should be watched
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
@@ -124,6 +130,23 @@ impl Default for Config {
     }
 }
 
+pub struct WatchConfig {
+    recursive_mode: RecursiveMode,
+    watch_filter: WatchFilter,
+}
+
+impl WatchConfig {
+    pub fn with_recursive_mode(recursive_mode: RecursiveMode) -> Self {
+        Self {
+            recursive_mode,
+            watch_filter: Default::default(),
+        }
+    }
+
+    pub fn is_recursive(&self) -> bool {
+        self.recursive_mode.is_recursive()
+    }
+}
 
 pub trait ShouldWatch {
     fn should_watch(&mut self, path: &Path) -> bool;
@@ -135,11 +158,57 @@ impl<T: FnMut(&Path) -> bool> ShouldWatch for T {
     }
 }
 
-pub(crate) struct WatchFilter(Option<Box<dyn ShouldWatch + Send>>);
+type ShouldWatchBox = Box<dyn ShouldWatch + Send>;
+type SharedShouldWatch = Rc<RefCell<ShouldWatchBox>>;
 
-impl ShouldWatch for WatchFilter {
-    fn should_watch(&mut self, path: &Path) -> bool {
-        self.0.as_mut().map(|filter| filter.should_watch(path)).unwrap_or_default()
+#[derive(Clone)]
+pub(crate) struct SharedWatchFilter(Option<SharedShouldWatch>);
+
+impl From<WatchFilter> for SharedWatchFilter {
+    fn from(value: WatchFilter) -> Self {
+        Self(value.0.map(|filter| Rc::new(RefCell::new(filter))))
     }
 }
 
+#[derive(Default)]
+pub struct WatchFilter(Option<Box<dyn ShouldWatch + Send>>);
+
+impl SharedWatchFilter {
+    pub fn should_watch(&mut self, path: &Path) -> bool {
+        self.0
+            .as_ref()
+            // because the reference never leaves any method, borrow_mut is safe to use and never panics
+            .map(|filter| filter.borrow_mut().should_watch(path))
+            .unwrap_or_default()
+    }
+}
+
+impl WatchFilter {
+    pub fn all() -> Self {
+        Self(None)
+    }
+
+    pub fn except<'a, P: AsRef<Path>, I: IntoIterator<Item = P>>(paths: I) -> Self {
+        let set: HashSet<PathBuf> = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect();
+        Self::with(move |path| !set.contains(path))
+    }
+
+    pub fn only<'a, P: AsRef<Path>, I: IntoIterator<Item = P>>(paths: I) -> Self {
+        let set: HashSet<PathBuf> = paths
+            .into_iter()
+            .map(|path| path.as_ref().to_path_buf())
+            .collect();
+        Self::with(move |path| set.contains(path))
+    }
+
+    pub fn new<T: ShouldWatch + Send + 'static>(filter: T) -> Self {
+        Self(Some(Box::new(filter)))
+    }
+
+    pub fn with<F: FnMut(&Path) -> bool + Send + 'static>(f: F) -> Self {
+        Self::new(f)
+    }
+}

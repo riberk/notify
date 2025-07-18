@@ -6,6 +6,7 @@
 
 use super::event::*;
 use super::{Config, Error, ErrorKind, EventHandler, RecursiveMode, Result, Watcher};
+use crate::config::WatchConfig;
 use crate::{bounded, unbounded, BoundSender, Receiver, Sender};
 use inotify as inotify_sys;
 use inotify_sys::{EventMask, Inotify, WatchDescriptor, WatchMask};
@@ -36,11 +37,38 @@ struct EventLoop {
     event_loop_rx: Receiver<EventLoopMsg>,
     inotify: Option<Inotify>,
     event_handler: Box<dyn EventHandler>,
-    /// PathBuf -> (WatchDescriptor, WatchMask, is_recursive, is_dir)
-    watches: HashMap<PathBuf, (WatchDescriptor, WatchMask, bool, bool)>,
+    
+    /// Watch descriptors by fs path
+    watches: HashMap<PathBuf, WatchDescriptorInfo>,
+
+    /// Reverse index for [Self::watches]
     paths: HashMap<WatchDescriptor, PathBuf>,
+
+    /// In progress rename event.
+    /// 
+    /// If both [`RenameMode::From`] and [`RenameMode::To`] are got in the single read of inotify file descriptor,
+    /// then only [`RenameMode::Both`] will be provided to the [`Self::event_handler`]
     rename_event: Option<Event>,
+
     follow_links: bool,
+}
+
+/// Our stuff around an inotify watch descriptor
+struct WatchDescriptorInfo {
+    /// The descriptor to watch
+    wd: WatchDescriptor,
+
+    /// What mask (what events will be watched) was used to add (or update) this descriptor
+    mask: WatchMask,
+
+    /// Recursive watch or not.
+    /// 
+    /// This is true for the directed added directories with [`RecursiveMode::Recursive`] 
+    /// and all its (recursive) children
+    is_recursive: bool,
+
+    /// The entry is a directory which is added explicitly
+    is_root_dir: bool,
 }
 
 /// Watcher implementation based on inotify
@@ -51,7 +79,7 @@ pub struct INotifyWatcher {
 }
 
 enum EventLoopMsg {
-    AddWatch(PathBuf, RecursiveMode, Sender<Result<()>>),
+    AddWatch(PathBuf, crate::config::WatchConfig, Sender<Result<()>>),
     RemoveWatch(PathBuf, Sender<Result<()>>),
     Shutdown,
     Configure(Config, BoundSender<Result<bool>>),
@@ -168,8 +196,8 @@ impl EventLoop {
     fn handle_messages(&mut self) {
         while let Ok(msg) = self.event_loop_rx.try_recv() {
             match msg {
-                EventLoopMsg::AddWatch(path, recursive_mode, tx) => {
-                    let _ = tx.send(self.add_watch(path, recursive_mode.is_recursive(), true));
+                EventLoopMsg::AddWatch(path, config, tx) => {
+                    let _ = tx.send(self.add_watch(path, config.is_recursive(), true));
                 }
                 EventLoopMsg::RemoveWatch(path, tx) => {
                     let _ = tx.send(self.remove_watch(path, false));
@@ -397,7 +425,7 @@ impl EventLoop {
         }
     }
 
-    fn add_watch(&mut self, path: PathBuf, is_recursive: bool, mut watch_self: bool) -> Result<()> {
+    fn add_watch(&mut self, path: PathBuf, config: bool, mut watch_self: bool) -> Result<()> {
         // If the watch is not recursive, or if we determine (by stat'ing the path to get its
         // metadata) that the watched path is not a directory, add a single path watch.
         if !is_recursive || !metadata(&path).map_err(Error::io_watch)?.is_dir() {
@@ -473,25 +501,25 @@ impl EventLoop {
     fn remove_watch(&mut self, path: PathBuf, remove_recursive: bool) -> Result<()> {
         match self.watches.remove(&path) {
             None => return Err(Error::watch_not_found().add_path(path)),
-            Some((w, _, is_recursive, _)) => {
+            Some(descriptor) => {
                 if let Some(ref mut inotify) = self.inotify {
                     let mut inotify_watches = inotify.watches();
                     log::trace!("removing inotify watch: {}", path.display());
 
                     inotify_watches
-                        .remove(w.clone())
+                        .remove(descriptor.wd.clone())
                         .map_err(|e| Error::io(e).add_path(path.clone()))?;
                     self.paths.remove(&w);
 
-                    if is_recursive || remove_recursive {
+                    if descriptor.is_recursive || remove_recursive {
                         let mut remove_list = Vec::new();
-                        for (w, p) in &self.paths {
-                            if p.starts_with(&path) {
+                        for (wd, child_path) in &self.paths {
+                            if child_path.starts_with(&path) {
                                 inotify_watches
-                                    .remove(w.clone())
-                                    .map_err(|e| Error::io(e).add_path(p.into()))?;
-                                self.watches.remove(p);
-                                remove_list.push(w.clone());
+                                    .remove(wd.clone())
+                                    .map_err(|e| Error::io(e).add_path(child_path.into()))?;
+                                self.watches.remove(child_path);
+                                remove_list.push(wd.clone());
                             }
                         }
                         for w in remove_list {
@@ -544,7 +572,7 @@ impl INotifyWatcher {
         Ok(INotifyWatcher { channel, waker })
     }
 
-    fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
+    fn watch_inner(&mut self, path: &Path, config: crate::config::WatchConfig) -> Result<()> {
         let pb = if path.is_absolute() {
             path.to_owned()
         } else {
@@ -584,7 +612,7 @@ impl Watcher for INotifyWatcher {
     }
 
     fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
-        self.watch_inner(path, recursive_mode)
+        self.watch_inner(path, WatchConfig ::with_recursive_mode(recursive_mode))
     }
 
     fn unwatch(&mut self, path: &Path) -> Result<()> {
@@ -600,6 +628,10 @@ impl Watcher for INotifyWatcher {
 
     fn kind() -> crate::WatcherKind {
         crate::WatcherKind::Inotify
+    }
+
+    fn watch_with(&mut self, path: &Path, config: crate::config::WatchConfig) -> Result<()> {
+        self.watch_inner(path, recursive_mode)
     }
 }
 

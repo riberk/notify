@@ -183,6 +183,7 @@ pub(crate) fn bounded<T>(cap: usize) -> (BoundSender<T>, Receiver<T>) {
     std::sync::mpsc::sync_channel(cap)
 }
 
+use crate::config::WatchConfig;
 #[cfg(all(target_os = "macos", not(feature = "macos_kqueue")))]
 pub use crate::fsevent::FsEventWatcher;
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -336,6 +337,8 @@ pub trait Watcher {
     /// [#165]: https://github.com/notify-rs/notify/issues/165
     /// [#166]: https://github.com/notify-rs/notify/issues/166
     fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()>;
+
+    fn watch_with(&mut self, path: &Path, config: WatchConfig) -> Result<()>;
 
     /// Stop watching a path.
     ///
