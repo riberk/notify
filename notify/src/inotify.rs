@@ -616,9 +616,30 @@ mod tests {
     use std::{
         sync::{atomic::AtomicBool, mpsc},
         thread::available_parallelism,
+        time::Duration,
     };
 
     use super::*;
+    use crate::test::*;
+    use pretty_assertions::assert_eq;
+
+    fn not_flaky(event: &Event) -> bool {
+        // Access events aren't real "flaky", but they are to noisy
+        if event.kind.is_access() {
+            return false;
+        }
+
+        // That kind of an event requires the both (RenameMode::From and RenameMode::To) events
+        // are read in the same batch, but this is not guaranteed.
+        if matches!(
+            event.kind,
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+        ) {
+            return false;
+        }
+
+        true
+    }
 
     #[test]
     fn inotify_watcher_is_send_and_sync() {
@@ -761,5 +782,342 @@ mod tests {
             "expected no events without path, but got {events_len}. first 10: {:#?}",
             &events[..LOG_LEN.min(events_len)]
         );
+    }
+
+    #[test]
+    fn create_file() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        watcher.watch_recursively(&tmpdir);
+
+        let path = tmpdir.path().join("entry");
+        std::fs::File::create_new(&path).expect("create");
+
+        rx.wait([event(EventKind::Create(CreateKind::File), &path)]);
+    }
+
+    #[test]
+    fn create_dir() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        watcher.watch_recursively(&tmpdir);
+
+        let path = tmpdir.path().join("entry");
+        std::fs::create_dir(&path).expect("create");
+
+        rx.wait([event(EventKind::Create(CreateKind::Folder), &path)]);
+    }
+
+    #[test]
+    fn write_file() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+
+        let path = tmpdir.path().join("entry");
+        std::fs::File::create_new(&path).expect("create");
+
+        watcher.watch_recursively(&tmpdir);
+        std::fs::write(&path, b"123").expect("write");
+
+        rx.wait([event(
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            &path,
+        )]);
+    }
+
+    #[test]
+    fn chmod_file() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+
+        let path = tmpdir.path().join("entry");
+        let file = std::fs::File::create_new(&path).expect("create");
+        let mut permissions = file.metadata().expect("metadata").permissions();
+        permissions.set_readonly(true);
+
+        watcher.watch_recursively(&tmpdir);
+        file.set_permissions(permissions).expect("set_permissions");
+
+        rx.wait([event(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            &path,
+        )]);
+    }
+
+    #[test]
+    fn rename_file() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+
+        let path = tmpdir.path().join("entry");
+        std::fs::File::create_new(&path).expect("create");
+
+        watcher.watch_recursively(&tmpdir);
+        let new_path = tmpdir.path().join("renamed");
+
+        std::fs::rename(&path, &new_path).expect("rename");
+
+        let events = [rx.recv(), rx.recv()]
+            .into_iter()
+            .map(|e| (e.attrs.tracker(), ExpectedEvent::from_event(e)))
+            .collect::<Vec<_>>();
+
+        let cookie = events.first().and_then(|e| e.0);
+        assert!(cookie.is_some(), "cookie is none: [events:#?]");
+
+        assert_eq!(
+            &events,
+            &[
+                (
+                    cookie,
+                    event(EventKind::Modify(ModifyKind::Name(RenameMode::From)), path)
+                ),
+                (
+                    cookie,
+                    event(
+                        EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                        new_path
+                    )
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn move_out_of_watched_dir() {
+        let tmpdir = testdir();
+        let subdir = tmpdir.path().join("subdir");
+        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+
+        let path = subdir.join("entry");
+        std::fs::create_dir_all(&subdir).expect("create_dir_all");
+        std::fs::File::create_new(&path).expect("create");
+
+        watcher.watch_recursively(&subdir);
+        let new_path = tmpdir.path().join("entry");
+
+        std::fs::rename(&path, &new_path).expect("rename");
+
+        let received = rx.recv();
+        assert!(
+            received.attrs.tracker().is_some(),
+            "cookie is none: [event:#?]"
+        );
+
+        assert_eq!(
+            ExpectedEvent::from_event(received),
+            event(EventKind::Modify(ModifyKind::Name(RenameMode::From)), path)
+        );
+        rx.ensure_empty();
+    }
+
+    #[test]
+    fn create_write_write_rename_write_remove() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+
+        let path = tmpdir.path().join("entry");
+        let new_path = tmpdir.path().join("renamed");
+
+        watcher.watch_recursively(&tmpdir);
+        std::fs::File::create_new(&path).expect("create");
+        std::fs::write(&path, b"123").expect("write 1");
+        std::fs::write(&path, b"321321312eewfrserf").expect("write 2");
+        std::fs::rename(&path, &new_path).expect("rename");
+        std::fs::write(&new_path, b"1").expect("write 3");
+        std::fs::remove_file(&new_path).expect("remove");
+
+        let mut events = Vec::new();
+        for event in rx.iter().filter(not_flaky) {
+            let last_event = event.kind.is_remove();
+            events.push(ExpectedEvent::from_event(event));
+            if last_event {
+                break;
+            }
+        }
+
+        assert_eq!(
+            &events,
+            &[
+                event(EventKind::Create(CreateKind::File), &path),
+                event(EventKind::Modify(ModifyKind::Data(DataChange::Any)), &path),
+                event(EventKind::Modify(ModifyKind::Data(DataChange::Any)), &path),
+                event(EventKind::Modify(ModifyKind::Name(RenameMode::From)), &path),
+                event(
+                    EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                    &new_path
+                ),
+                event(
+                    EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                    &new_path
+                ),
+                event(EventKind::Remove(RemoveKind::File), &new_path),
+            ]
+        )
+    }
+
+    #[test]
+    fn rename_twice() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+
+        let path = tmpdir.path().join("entry");
+        std::fs::File::create_new(&path).expect("create");
+
+        watcher.watch_recursively(&tmpdir);
+        let new_path1 = tmpdir.path().join("renamed1");
+        let new_path2 = tmpdir.path().join("renamed2");
+
+        std::fs::rename(&path, &new_path1).expect("rename1");
+        std::fs::rename(&new_path1, &new_path2).expect("rename2");
+
+        let mut events = Vec::new();
+        let mut cookies = Vec::new();
+        for event in rx.iter().filter(not_flaky) {
+            let Some(tracker) = event.attrs.tracker() else {
+                continue;
+            };
+
+            if cookies.last() != Some(&tracker) {
+                cookies.push(tracker);
+            }
+
+            let last_event =
+                event.kind.is_modify() && event.paths.first().is_some_and(|p| p == &new_path2);
+
+            events.push((tracker, ExpectedEvent::from_event(event)));
+            if last_event {
+                break;
+            }
+        }
+
+        assert_eq!(cookies.len(), 2);
+
+        assert_eq!(
+            &events,
+            &[
+                (
+                    cookies[0],
+                    event(EventKind::Modify(ModifyKind::Name(RenameMode::From)), &path)
+                ),
+                (
+                    cookies[0],
+                    event(
+                        EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                        &new_path1
+                    )
+                ),
+                (
+                    cookies[1],
+                    event(
+                        EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                        &new_path1
+                    )
+                ),
+                (
+                    cookies[1],
+                    event(
+                        EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                        &new_path2
+                    )
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_file_mtime() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+
+        let path = tmpdir.path().join("entry");
+        let file = std::fs::File::create_new(&path).expect("create");
+
+        watcher.watch_recursively(&tmpdir);
+
+        file.set_modified(
+            std::time::SystemTime::now()
+                .checked_sub(Duration::from_secs(60 * 60))
+                .expect("time"),
+        )
+        .expect("set_time");
+
+        assert_eq!(
+            ExpectedEvent::from_event(rx.recv()),
+            event(EventKind::Modify(ModifyKind::Data(DataChange::Any)), &path)
+        );
+        rx.ensure_empty();
+    }
+
+    #[test]
+    fn write_file_non_recursive_watch() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+
+        let path = tmpdir.path().join("entry");
+        std::fs::File::create_new(&path).expect("create");
+
+        watcher.watch_nonrecursively(&path);
+
+        std::fs::write(&path, b"123").expect("write");
+
+        let actual = rx
+            .iter()
+            .find(|e| e.kind.is_modify())
+            .map(ExpectedEvent::from_event);
+
+        assert_eq!(
+            actual,
+            Some(event(
+                EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                &path
+            ))
+        );
+    }
+
+    #[test]
+    #[ignore = "see https://github.com/notify-rs/notify/issues/727"]
+    fn recursive_creation() {
+        let tmpdir = testdir();
+        let nested1 = tmpdir.path().join("1");
+        let nested2 = tmpdir.path().join("1/2");
+        let nested3 = tmpdir.path().join("1/2/3");
+        let nested4 = tmpdir.path().join("1/2/3/4");
+        let nested5 = tmpdir.path().join("1/2/3/4/5");
+        let nested6 = tmpdir.path().join("1/2/3/4/5/6");
+        let nested7 = tmpdir.path().join("1/2/3/4/5/6/7");
+        let nested8 = tmpdir.path().join("1/2/3/4/5/6/7/8");
+        let nested9 = tmpdir.path().join("1/2/3/4/5/6/7/8/9");
+
+        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+
+        watcher.watch_recursively(&tmpdir);
+
+        std::fs::create_dir_all(&nested9).expect("create_dir_all");
+
+        let mut events = Vec::new();
+        for event in rx.iter().filter(|e| !e.kind.is_access()) {
+            let last_event =
+                event.kind.is_create() && event.paths.first().is_some_and(|p| p == &nested9);
+            events.push(ExpectedEvent::from_event(event));
+            if last_event {
+                break;
+            }
+        }
+
+        assert_eq!(
+            &events,
+            &[
+                event(EventKind::Create(CreateKind::Folder), &nested1),
+                event(EventKind::Create(CreateKind::Folder), &nested2),
+                event(EventKind::Create(CreateKind::Folder), &nested3),
+                event(EventKind::Create(CreateKind::Folder), &nested4),
+                event(EventKind::Create(CreateKind::Folder), &nested5),
+                event(EventKind::Create(CreateKind::Folder), &nested6),
+                event(EventKind::Create(CreateKind::Folder), &nested7),
+                event(EventKind::Create(CreateKind::Folder), &nested8),
+                event(EventKind::Create(CreateKind::Folder), &nested9),
+            ]
+        )
     }
 }
