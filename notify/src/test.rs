@@ -1,6 +1,8 @@
 #![allow(dead_code)] // because its are test helpers
 
 use std::{
+    fmt::Debug,
+    ops::Deref,
     path::{Path, PathBuf},
     sync::mpsc::{self, TryRecvError},
     time::Duration,
@@ -258,17 +260,13 @@ impl ExpectedEvent {
     }
 }
 
-pub fn event(kind: EventKind, path: impl AsRef<Path>) -> ExpectedEvent {
-    ExpectedEvent::with_path(kind, path)
-}
-
 pub fn testdir() -> tempfile::TempDir {
     tempfile::tempdir().expect("Unable to create tempdir")
 }
 
 /// Creates a [`PollWatcher`] with comparable content and manual polling.
 ///
-/// Returned [`Receiver`] will send messasge to poll changes before wait-methods
+/// Returned [`Receiver`] will send a message to poll changes before wait-methods
 pub fn poll_watcher() -> (TestWatcher<PollWatcher>, Receiver) {
     let (tx, rx) = mpsc::channel();
     let watcher = PollWatcher::new(
@@ -295,4 +293,414 @@ pub fn poll_watcher() -> (TestWatcher<PollWatcher>, Receiver) {
     };
 
     (watcher, rx)
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Cookies(Vec<usize>);
+
+impl Cookies {
+    /// Pushes new cookie if it is some and is not equal to the last
+    pub fn try_push(&mut self, event: &Event) -> bool {
+        let Some(tracker) = event.attrs.tracker() else {
+            return false;
+        };
+
+        if self.0.last() != Some(&tracker) {
+            self.0.push(tracker);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn ensure_len<E: Debug>(&self, len: usize, events: &[E]) {
+        assert_eq!(
+            self.len(),
+            len,
+            "Unexpected cookies len. events: {events:#?}"
+        )
+    }
+}
+
+impl Deref for Cookies {
+    type Target = [usize];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub struct StoreCookies<'a, I> {
+    cookies: &'a mut Cookies,
+    inner: I,
+}
+
+impl<I: Iterator<Item = Event>> Iterator for StoreCookies<'_, I> {
+    type Item = Event;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let event = self.inner.next()?;
+        self.cookies.try_push(&event);
+        Some(event)
+    }
+}
+
+pub struct IgnoreAccess<I> {
+    inner: I,
+}
+
+impl<I: Iterator<Item = Event>> Iterator for IgnoreAccess<I> {
+    type Item = Event;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let event = self.inner.next()?;
+
+            if !event.kind.is_access() {
+                break Some(event);
+            }
+        }
+    }
+}
+
+pub trait TestIteratorExt: Sized {
+    /// Skips any [`EventKind::Access`] events
+    fn ignore_access(self) -> IgnoreAccess<Self>
+    where
+        Self: Sized,
+    {
+        IgnoreAccess { inner: self }
+    }
+
+    /// Stores any encountered [`notify_types::event::EventAttributes::tracker`] into the provided [`Cookies`]
+    fn store_cookies(self, cookies: &mut Cookies) -> StoreCookies<'_, Self> {
+        StoreCookies {
+            cookies,
+            inner: self,
+        }
+    }
+}
+
+impl<I: Iterator<Item = Event>> TestIteratorExt for I {}
+
+pub use actual_ctors::*;
+pub use expected_ctors::*;
+
+#[rustfmt::skip] // due to annoying macro invocations formatting 
+mod actual_ctors {
+    use notify_types::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, Event, EventKind, MetadataKind, ModifyKind,
+        RemoveKind, RenameMode,
+    };
+
+    use super::ExpectedEvent;
+
+    pub fn actual(event: Event) -> ExpectedEvent {
+        ExpectedEvent::from_event(event)
+    }
+
+    macro_rules! actual_if_matches {
+        ($name: ident, $pattern:pat $(if $guard:expr)?) => {
+            pub fn $name(event: Event) -> Option<ExpectedEvent> {
+                actual_if(event, |kind| matches!(kind, $pattern $(if $guard)?))
+            }
+        };
+    }
+    
+    fn actual_if(event: Event, f: impl FnOnce(EventKind) -> bool) -> Option<ExpectedEvent> {
+        if f(event.kind) {
+            Some(actual(event))
+        } else {
+            None
+        }
+    }
+
+    actual_if_matches!(actual_any, EventKind::Any);
+    actual_if_matches!(actual_other, EventKind::Other);
+    actual_if_matches!(actual_create, EventKind::Create(_));
+    actual_if_matches!(actual_create_any, EventKind::Create(CreateKind::Any));
+    actual_if_matches!(actual_create_other, EventKind::Create(CreateKind::Other));
+    actual_if_matches!(actual_create_file, EventKind::Create(CreateKind::File));
+    actual_if_matches!(actual_create_folder, EventKind::Create(CreateKind::Folder));
+
+    actual_if_matches!(actual_remove, EventKind::Remove(_));
+    actual_if_matches!(actual_remove_any, EventKind::Remove(RemoveKind::Any));
+    actual_if_matches!(actual_remove_other, EventKind::Remove(RemoveKind::Other));
+    actual_if_matches!(actual_remove_file, EventKind::Remove(RemoveKind::File));
+    actual_if_matches!(actual_remove_folder, EventKind::Remove(RemoveKind::Folder));
+
+    actual_if_matches!(actual_modify, EventKind::Modify(_));
+    actual_if_matches!(actual_modify_any, EventKind::Modify(ModifyKind::Any));
+    actual_if_matches!(actual_modify_other, EventKind::Modify(ModifyKind::Other));
+
+    actual_if_matches!(actual_modify_data, EventKind::Modify(ModifyKind::Data(_)));
+    actual_if_matches!(actual_modify_data_any, EventKind::Modify(ModifyKind::Data(DataChange::Any)));
+    actual_if_matches!(actual_modify_data_other, EventKind::Modify(ModifyKind::Data(DataChange::Other)));
+    actual_if_matches!(actual_modify_data_content, EventKind::Modify(ModifyKind::Data(DataChange::Content)));
+    actual_if_matches!(actual_modify_data_size, EventKind::Modify(ModifyKind::Data(DataChange::Size)));
+
+    actual_if_matches!(actual_modify_meta,EventKind::Modify(ModifyKind::Metadata(_)));
+    actual_if_matches!(actual_modify_meta_any,EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)));
+    actual_if_matches!(actual_modify_meta_other, EventKind::Modify(ModifyKind::Metadata(MetadataKind::Other)));
+    actual_if_matches!(actual_modify_meta_extended, EventKind::Modify(ModifyKind::Metadata(MetadataKind::Extended)));
+    actual_if_matches!(actual_modify_meta_owner, EventKind::Modify(ModifyKind::Metadata(MetadataKind::Ownership)));
+    actual_if_matches!(actual_modify_meta_perm, EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions)));
+    actual_if_matches!(actual_modify_meta_mtime, EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)));
+    actual_if_matches!(actual_modify_meta_atime, EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)));
+
+    actual_if_matches!(actual_rename, EventKind::Modify(ModifyKind::Name(_)));
+    actual_if_matches!(actual_rename_from, EventKind::Modify(ModifyKind::Name(RenameMode::From)));
+    actual_if_matches!(actual_rename_to, EventKind::Modify(ModifyKind::Name(RenameMode::To)));
+    actual_if_matches!(actual_rename_both, EventKind::Modify(ModifyKind::Name(RenameMode::Both)));
+
+    actual_if_matches!(actual_access, EventKind::Access(_));
+    actual_if_matches!(actual_access_any, EventKind::Access(AccessKind::Any));
+    actual_if_matches!(actual_access_other, EventKind::Access(AccessKind::Other));
+    actual_if_matches!(actual_access_read, EventKind::Access(AccessKind::Read));
+    actual_if_matches!(actual_access_open, EventKind::Access(AccessKind::Open(_)));
+    actual_if_matches!(actual_access_open_any, EventKind::Access(AccessKind::Open(AccessMode::Any)));
+    actual_if_matches!(actual_access_open_other, EventKind::Access(AccessKind::Open(AccessMode::Other)));
+    actual_if_matches!(actual_access_open_read, EventKind::Access(AccessKind::Open(AccessMode::Read)));
+    actual_if_matches!(actual_access_open_write, EventKind::Access(AccessKind::Open(AccessMode::Write)));
+    actual_if_matches!(actual_access_open_exec, EventKind::Access(AccessKind::Open(AccessMode::Execute)));
+    actual_if_matches!(actual_access_close, EventKind::Access(AccessKind::Close(_)));
+    actual_if_matches!(actual_access_close_any, EventKind::Access(AccessKind::Close(AccessMode::Any)));
+    actual_if_matches!(actual_access_close_other, EventKind::Access(AccessKind::Close(AccessMode::Other)));
+    actual_if_matches!(actual_access_close_read, EventKind::Access(AccessKind::Close(AccessMode::Read)));
+    actual_if_matches!(actual_access_close_write, EventKind::Access(AccessKind::Close(AccessMode::Write)));
+    actual_if_matches!(actual_access_close_exec, EventKind::Access(AccessKind::Close(AccessMode::Execute)));
+}
+
+mod expected_ctors {
+    use std::path::Path;
+
+    use notify_types::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, EventKind, MetadataKind, ModifyKind,
+        RemoveKind, RenameMode,
+    };
+
+    use crate::test::ExpectedEvent;
+
+    pub fn expected(kind: EventKind, path: impl AsRef<Path>) -> ExpectedEvent {
+        ExpectedEvent::with_path(kind, path)
+    }
+
+    pub fn expected_any(path: impl AsRef<Path>) -> ExpectedEvent {
+        ExpectedEvent::with_path(EventKind::Any, path)
+    }
+
+    pub fn expected_other(path: impl AsRef<Path>) -> ExpectedEvent {
+        ExpectedEvent::with_path(EventKind::Other, path)
+    }
+
+    pub fn expected_create(kind: CreateKind, path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Create(kind), path)
+    }
+
+    pub fn expected_create_any(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_create(CreateKind::Any, path)
+    }
+
+    pub fn expected_create_other(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_create(CreateKind::Other, path)
+    }
+
+    pub fn expected_create_file(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_create(CreateKind::File, path)
+    }
+
+    pub fn expected_create_folder(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_create(CreateKind::Folder, path)
+    }
+
+    pub fn expected_remove(kind: RemoveKind, path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Remove(kind), path)
+    }
+
+    pub fn expected_remove_any(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Remove(RemoveKind::Any), path)
+    }
+
+    pub fn expected_remove_other(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Remove(RemoveKind::Other), path)
+    }
+
+    pub fn expected_remove_file(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Remove(RemoveKind::File), path)
+    }
+
+    pub fn expected_remove_folder(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Remove(RemoveKind::Folder), path)
+    }
+
+    pub fn expected_modify(kind: ModifyKind, path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Modify(kind), path)
+    }
+
+    pub fn expected_modify_any(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Modify(ModifyKind::Any), path)
+    }
+
+    pub fn expected_modify_other(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Modify(ModifyKind::Other), path)
+    }
+
+    pub fn expected_modify_data(change: DataChange, path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Modify(ModifyKind::Data(change)), path)
+    }
+
+    pub fn expected_modify_data_any(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Modify(ModifyKind::Data(DataChange::Any)), path)
+    }
+
+    pub fn expected_modify_data_other(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Modify(ModifyKind::Data(DataChange::Other)), path)
+    }
+
+    pub fn expected_modify_data_content(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            path,
+        )
+    }
+
+    pub fn expected_modify_data_size(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Modify(ModifyKind::Data(DataChange::Size)), path)
+    }
+
+    pub fn expected_modify_meta(kind: MetadataKind, path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Modify(ModifyKind::Metadata(kind)), path)
+    }
+
+    pub fn expected_modify_meta_any(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            path,
+        )
+    }
+
+    pub fn expected_modify_meta_other(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Other)),
+            path,
+        )
+    }
+
+    pub fn expected_modify_meta_atime(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)),
+            path,
+        )
+    }
+
+    pub fn expected_modify_meta_mtime(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)),
+            path,
+        )
+    }
+
+    pub fn expected_modify_meta_extended(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Extended)),
+            path,
+        )
+    }
+
+    pub fn expected_modify_meta_owner(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Ownership)),
+            path,
+        )
+    }
+
+    pub fn expected_modify_meta_perm(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions)),
+            path,
+        )
+    }
+
+    pub fn expected_rename(mode: RenameMode, path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_modify(ModifyKind::Name(mode), path)
+    }
+
+    pub fn expected_rename_any(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_rename(RenameMode::Any, path)
+    }
+
+    pub fn expected_rename_other(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_rename(RenameMode::Other, path)
+    }
+
+    pub fn expected_rename_from(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_rename(RenameMode::From, path)
+    }
+
+    pub fn expected_rename_to(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_rename(RenameMode::To, path)
+    }
+
+    pub fn expected_rename_both(from: impl AsRef<Path>, to: impl AsRef<Path>) -> ExpectedEvent {
+        ExpectedEvent {
+            kind: EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            paths: vec![from.as_ref().to_path_buf(), to.as_ref().to_path_buf()],
+        }
+    }
+
+    pub fn expected_access(kind: AccessKind, path: impl AsRef<Path>) -> ExpectedEvent {
+        expected(EventKind::Access(kind), path)
+    }
+
+    pub fn expected_open(mode: AccessMode, path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_access(AccessKind::Open(mode), path)
+    }
+
+    pub fn expected_open_any(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_access(AccessKind::Open(AccessMode::Any), path)
+    }
+
+    pub fn expected_open_other(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_access(AccessKind::Open(AccessMode::Other), path)
+    }
+
+    pub fn expected_open_read(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_access(AccessKind::Open(AccessMode::Read), path)
+    }
+
+    pub fn expected_open_write(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_access(AccessKind::Open(AccessMode::Write), path)
+    }
+
+    pub fn expected_open_exec(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_access(AccessKind::Open(AccessMode::Execute), path)
+    }
+
+    pub fn expected_close(mode: AccessMode, path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_access(AccessKind::Close(mode), path)
+    }
+
+    pub fn expected_close_any(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_access(AccessKind::Close(AccessMode::Any), path)
+    }
+
+    pub fn expected_close_other(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_access(AccessKind::Close(AccessMode::Other), path)
+    }
+
+    pub fn expected_close_read(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_access(AccessKind::Close(AccessMode::Read), path)
+    }
+
+    pub fn expected_close_write(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_access(AccessKind::Close(AccessMode::Write), path)
+    }
+
+    pub fn expected_close_exec(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_access(AccessKind::Close(AccessMode::Execute), path)
+    }
+
+    pub fn expected_read(path: impl AsRef<Path>) -> ExpectedEvent {
+        expected_access(AccessKind::Read, path)
+    }
 }

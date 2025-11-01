@@ -697,7 +697,7 @@ mod tests {
         let path = tmpdir.path().join("entry");
         std::fs::File::create_new(&path).expect("Unable to create");
 
-        rx.wait_exact([event(EventKind::Create(CreateKind::Any), &path)]);
+        rx.wait_exact([expected(EventKind::Create(CreateKind::Any), &path)]);
     }
 
     #[test]
@@ -709,7 +709,7 @@ mod tests {
         let path = tmpdir.path().join("entry");
         std::fs::create_dir(&path).expect("Unable to create");
 
-        rx.wait_exact([event(EventKind::Create(CreateKind::Any), &path)]);
+        rx.wait_exact([expected(EventKind::Create(CreateKind::Any), &path)]);
     }
 
     #[test]
@@ -722,7 +722,7 @@ mod tests {
         watcher.watch_recursively(&tmpdir);
         std::fs::write(&path, b"123").expect("Unable to write");
 
-        rx.wait_exact([event(
+        rx.wait_exact([expected(
             EventKind::Modify(ModifyKind::Data(DataChange::Any)),
             &path,
         )]);
@@ -738,6 +738,6 @@ mod tests {
         watcher.watch_recursively(&tmpdir);
         std::fs::remove_file(&path).expect("Unable to remove");
 
-        rx.wait_exact([event(EventKind::Remove(RemoveKind::Any), &path)]);
+        rx.wait_exact([expected(EventKind::Remove(RemoveKind::Any), &path)]);
     }
 }
