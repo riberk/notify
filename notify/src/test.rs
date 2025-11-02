@@ -1,14 +1,15 @@
 #![allow(dead_code)] // because its are test helpers
 
 use std::{
+    collections::VecDeque,
     fmt::Debug,
     ops::Deref,
     path::{Path, PathBuf},
-    sync::mpsc::{self, TryRecvError},
+    sync::mpsc::{self},
     time::Duration,
 };
 
-use notify_types::event::{Event, EventKind};
+use notify_types::event::Event;
 
 use crate::{Config, Error, PollWatcher, RecommendedWatcher, RecursiveMode, Watcher, WatcherKind};
 use pretty_assertions::assert_eq;
@@ -23,66 +24,43 @@ pub struct Receiver {
 impl Receiver {
     const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 
-    /// Waits for events in the same order as they are provided,
-    /// and fails if it encounters an unexpected one.
-    ///
-    /// Before any actions, it'll call [`Self::detect_changes`].
-    /// It simplify any tests with [`PollWatcher`]
-    pub fn wait_exact(&mut self, expected: impl IntoIterator<Item = ExpectedEvent>) {
+    fn wait_expected<C: ExpectedCollection>(&mut self, mut state: ExpectedState<C>) {
         self.detect_changes();
-        for (idx, expected) in expected.into_iter().enumerate() {
+        while !state.is_empty() {
             match self.try_recv() {
-                Ok(result) => match result {
-                    Ok(event) => assert_eq!(
-                        ExpectedEvent::from_event(event),
-                        expected,
-                        "Unexpected event by index {idx}"
+                Ok(res) => match res {
+                    Ok(event) => state.check(event),
+                    Err(err) => panic!(
+                        "Got an error from the watcher {:?}: {err:?}. State: {state:#?}",
+                        self.kind
                     ),
-                    Err(err) => panic!("Expected an event by index {idx} but got {err:?}"),
                 },
-                Err(err) => panic!("Unable to check the event by index {idx}: {err:?}"),
+                Err(e) => panic!(
+                    "Recv error: {e:?}. Watcher: {:?}. State: {state:#?}",
+                    self.kind
+                ),
             }
-        }
-        match self.rx.try_recv() {
-            Ok(res) => panic!("Unexpected extra event: {res:?}"),
-            Err(err) => assert!(
-                matches!(err, TryRecvError::Empty),
-                "Unexpected error: expected Empty, actual: {err:?}"
-            ),
         }
     }
 
-    /// Waits for the provided events in any order and ignores unexpected ones.
-    ///
-    /// Before any actions, it'll call [`Self::detect_changes`].
-    /// It simplify any tests with [`PollWatcher`]
-    pub fn wait(&mut self, iter: impl IntoIterator<Item = ExpectedEvent>) {
-        self.detect_changes();
-        let mut expected = iter.into_iter().enumerate().collect::<Vec<_>>();
-        let mut received = Vec::new();
+    /// Waits for the events in the same order as they provided and fails on an unexpected one.
+    pub fn wait_ordered_exact(&mut self, expected: impl IntoIterator<Item = ExpectedEvent>) {
+        self.wait_expected(ExpectedState::ordered(expected).disallow_unexpected())
+    }
 
-        while !expected.is_empty() {
-            match self.try_recv() {
-                Ok(result) => match result {
-                    Ok(event) => {
-                        received.push(event.clone());
-                        let mut found_idx = None;
-                        let actual = ExpectedEvent::from_event(event);
-                        for (idx, (_, expected)) in expected.iter().enumerate() {
-                            if &actual == expected {
-                                found_idx = Some(idx);
-                                break;
-                            }
-                        }
-                        if let Some(found_idx) = found_idx {
-                            expected.swap_remove(found_idx);
-                        }
-                    }
-                    Err(err) => panic!("Got an error from the watcher {:?}: {err:?}. Received: {received:#?}. Weren't received: {expected:#?}", self.kind),
-                },
-                Err(err) => panic!("Watcher {:?} recv error: {err:?}. Received: {received:#?}. Weren't received: {expected:#?}", self.kind),
-            }
-        }
+    /// Waits for the events in the same order as they provided and ignores unexpected ones.
+    pub fn wait_ordered(&mut self, expected: impl IntoIterator<Item = ExpectedEvent>) {
+        self.wait_expected(ExpectedState::ordered(expected).allow_unexpected())
+    }
+
+    /// Waits for the events in any order and fails on an unexpected one.
+    pub fn wait_unordered_exact(&mut self, expected: impl IntoIterator<Item = ExpectedEvent>) {
+        self.wait_expected(ExpectedState::unordered(expected).disallow_unexpected())
+    }
+
+    /// Waits for the events in any order and ignores unexpected ones.
+    pub fn wait_unordered(&mut self, expected: impl IntoIterator<Item = ExpectedEvent>) {
+        self.wait_expected(ExpectedState::unordered(expected).allow_unexpected())
     }
 
     /// Waits a specific event.
@@ -163,6 +141,126 @@ impl Receiver {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnexpectedEventBehaviour {
+    Ignore,
+    Panic,
+}
+
+#[derive(Debug)]
+struct ExpectedState<C> {
+    remain: C,
+    received: Vec<Event>,
+    unexpeted_event_behaviour: UnexpectedEventBehaviour,
+}
+
+impl ExpectedState<Ordered> {
+    pub fn ordered(iter: impl IntoIterator<Item = ExpectedEvent>) -> Self {
+        Self::new(iter)
+    }
+}
+
+impl ExpectedState<Unordered> {
+    pub fn unordered(iter: impl IntoIterator<Item = ExpectedEvent>) -> Self {
+        Self::new(iter)
+    }
+}
+
+impl<C: ExpectedCollection + Debug> ExpectedState<C> {
+    pub fn new(iter: impl IntoIterator<Item = ExpectedEvent>) -> Self {
+        Self {
+            remain: iter.into_iter().collect(),
+            received: Default::default(),
+            unexpeted_event_behaviour: UnexpectedEventBehaviour::Ignore,
+        }
+    }
+
+    pub fn allow_unexpected(mut self) -> Self {
+        self.unexpeted_event_behaviour = UnexpectedEventBehaviour::Ignore;
+        self
+    }
+
+    pub fn disallow_unexpected(mut self) -> Self {
+        self.unexpeted_event_behaviour = UnexpectedEventBehaviour::Panic;
+        self
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remain.is_empty()
+    }
+
+    fn check(&mut self, event: Event) {
+        let is_expected = self.remain.is_expected_event(&event);
+        self.received.push(event);
+        if !is_expected && self.unexpeted_event_behaviour == UnexpectedEventBehaviour::Panic {
+            panic!("Unexpected event. State: {:#?}", self)
+        }
+    }
+}
+
+trait ExpectedCollection: Debug + FromIterator<ExpectedEvent> {
+    fn is_empty(&self) -> bool;
+
+    /// Returns true if the event is expected by this collection
+    fn is_expected_event(&mut self, event: &Event) -> bool;
+}
+
+/// Stores original indexes for events to debug purposes
+#[derive(Debug)]
+struct Unordered(Vec<(usize, ExpectedEvent)>);
+
+#[derive(Debug)]
+struct Ordered(VecDeque<ExpectedEvent>);
+
+impl ExpectedCollection for Unordered {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn is_expected_event(&mut self, event: &Event) -> bool {
+        let found_idx = self
+            .0
+            .iter()
+            .enumerate()
+            .find(|(_, (_, expected))| expected == event)
+            .map(|(idx, _)| idx);
+        match found_idx {
+            Some(found_idx) => {
+                self.0.swap_remove(found_idx);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl ExpectedCollection for Ordered {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn is_expected_event(&mut self, event: &Event) -> bool {
+        if self.0.front().is_some_and(|expected| expected == event) {
+            self.0.pop_front();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl FromIterator<ExpectedEvent> for Unordered {
+    fn from_iter<T: IntoIterator<Item = ExpectedEvent>>(iter: T) -> Self {
+        Self(iter.into_iter().enumerate().collect())
+    }
+}
+
+impl FromIterator<ExpectedEvent> for Ordered {
+    fn from_iter<T: IntoIterator<Item = ExpectedEvent>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
 #[derive(Debug)]
 pub struct ChannelConfig {
     timeout: Duration,
@@ -237,31 +335,400 @@ pub fn recommended_channel() -> (TestWatcher<RecommendedWatcher>, Receiver) {
     channel()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExpectedEvent {
-    kind: EventKind,
-    paths: Vec<PathBuf>,
-}
+pub use expect::*;
 
-impl ExpectedEvent {
-    pub fn new(kind: EventKind, paths: Vec<PathBuf>) -> Self {
-        Self { kind, paths }
+mod expect {
+    use std::path::{Path, PathBuf};
+
+    use notify_types::event::{
+        AccessKind, AccessMode, CreateKind, DataChange, Event, EventKind, MetadataKind, ModifyKind,
+        RemoveKind, RenameMode,
+    };
+
+    pub fn expected(path: impl AsRef<Path>) -> ExpectedEvent {
+        ExpectedEvent::default().add_path(path)
     }
 
-    pub fn with_path(kind: EventKind, path: impl AsRef<Path>) -> Self {
-        Self::new(kind, vec![path.as_ref().to_path_buf()])
+    #[derive(Debug, Default, Clone)]
+    pub struct ExpectedEvent {
+        kind: Option<ExpectedEventKind>,
+        paths: Option<Vec<PathBuf>>,
     }
 
-    pub fn from_event(e: Event) -> Self {
-        Self {
-            kind: e.kind,
-            paths: e.paths,
+    #[derive(Debug, Clone, Copy)]
+    enum ExpectedEventKind {
+        Any,
+        Access(Option<ExpectedAccessKind>),
+        Create(Option<CreateKind>),
+        Modify(Option<ExpectedModifyKind>),
+        Remove(Option<RemoveKind>),
+        Other,
+    }
+
+    impl PartialEq<EventKind> for ExpectedEventKind {
+        fn eq(&self, other: &EventKind) -> bool {
+            match self {
+                ExpectedEventKind::Any => matches!(other, EventKind::Any),
+                ExpectedEventKind::Access(expected) => {
+                    let EventKind::Access(other) = other else {
+                        return false;
+                    };
+                    expected.is_none_or(|expected| &expected == other)
+                }
+                ExpectedEventKind::Create(expected) => {
+                    let EventKind::Create(other) = other else {
+                        return false;
+                    };
+                    expected.is_none_or(|expected| &expected == other)
+                }
+                ExpectedEventKind::Modify(expected) => {
+                    let EventKind::Modify(other) = other else {
+                        return false;
+                    };
+                    expected.is_none_or(|expected| &expected == other)
+                }
+                ExpectedEventKind::Remove(expected) => {
+                    let EventKind::Remove(other) = other else {
+                        return false;
+                    };
+                    expected.is_none_or(|expected| &expected == other)
+                }
+                ExpectedEventKind::Other => matches!(other, EventKind::Other),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ExpectedAccessKind {
+        Any,
+        Read,
+        Open(Option<AccessMode>),
+        Close(Option<AccessMode>),
+        Other,
+    }
+
+    impl PartialEq<AccessKind> for ExpectedAccessKind {
+        fn eq(&self, other: &AccessKind) -> bool {
+            match self {
+                ExpectedAccessKind::Any => matches!(other, AccessKind::Any),
+                ExpectedAccessKind::Read => matches!(other, AccessKind::Read),
+                ExpectedAccessKind::Open(expected) => {
+                    let AccessKind::Open(other) = other else {
+                        return false;
+                    };
+                    expected.is_none_or(|expected| &expected == other)
+                }
+                ExpectedAccessKind::Close(expected) => {
+                    let AccessKind::Close(other) = other else {
+                        return false;
+                    };
+                    expected.is_none_or(|expected| &expected == other)
+                }
+                ExpectedAccessKind::Other => matches!(other, AccessKind::Other),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ExpectedModifyKind {
+        Any,
+        Data(Option<DataChange>),
+        Metadata(Option<MetadataKind>),
+        Name(Option<RenameMode>),
+        Other,
+    }
+
+    impl PartialEq<ModifyKind> for ExpectedModifyKind {
+        fn eq(&self, other: &ModifyKind) -> bool {
+            match self {
+                ExpectedModifyKind::Any => matches!(other, ModifyKind::Any),
+                ExpectedModifyKind::Data(expected) => {
+                    let ModifyKind::Data(other) = other else {
+                        return false;
+                    };
+                    expected.is_none_or(|expected| &expected == other)
+                }
+                ExpectedModifyKind::Metadata(expected) => {
+                    let ModifyKind::Metadata(other) = other else {
+                        return false;
+                    };
+                    expected.is_none_or(|expected| &expected == other)
+                }
+                ExpectedModifyKind::Name(expected) => {
+                    let ModifyKind::Name(other) = other else {
+                        return false;
+                    };
+                    expected.is_none_or(|expected| &expected == other)
+                }
+                ExpectedModifyKind::Other => matches!(other, ModifyKind::Other),
+            }
+        }
+    }
+
+    impl PartialEq<Event> for ExpectedEvent {
+        fn eq(&self, other: &Event) -> bool {
+            let Self { kind, paths } = self;
+            kind.is_none_or(|kind| kind == other.kind)
+                | paths
+                    .as_ref()
+                    .is_none_or(|expected| expected == &other.paths)
+        }
+    }
+
+    macro_rules! kind {
+        ($name: ident, $kind: expr) => {
+            pub fn $name(self) -> Self {
+                self.kind($kind)
+            }
+        };
+    }
+
+    impl ExpectedEvent {
+        pub fn add_path(mut self, path: impl AsRef<Path>) -> Self {
+            match &mut self.paths {
+                Some(paths) => paths.push(path.as_ref().to_path_buf()),
+                None => self.paths = Some(vec![path.as_ref().to_path_buf()]),
+            }
+            self
+        }
+
+        kind!(any, ExpectedEventKind::Any);
+        kind!(other, ExpectedEventKind::Other);
+
+        kind!(modify, ExpectedEventKind::Modify(None));
+        kind!(
+            modify_any,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Any))
+        );
+        kind!(
+            modify_other,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Other))
+        );
+
+        kind!(
+            modify_data,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Data(None)))
+        );
+        kind!(
+            modify_data_any,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Data(Some(DataChange::Any))))
+        );
+        kind!(
+            modify_data_other,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Data(Some(DataChange::Other))))
+        );
+        kind!(
+            modify_data_content,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Data(Some(DataChange::Content))))
+        );
+        kind!(
+            modify_data_size,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Data(Some(DataChange::Size))))
+        );
+
+        kind!(
+            modify_meta,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Metadata(None)))
+        );
+        kind!(
+            modify_meta_any,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Metadata(Some(MetadataKind::Any))))
+        );
+        kind!(
+            modify_meta_other,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Metadata(Some(
+                MetadataKind::Other
+            ))))
+        );
+        kind!(
+            modify_meta_atime,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Metadata(Some(
+                MetadataKind::AccessTime
+            ))))
+        );
+        kind!(
+            modify_meta_mtime,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Metadata(Some(
+                MetadataKind::WriteTime
+            ))))
+        );
+        kind!(
+            modify_meta_owner,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Metadata(Some(
+                MetadataKind::Ownership
+            ))))
+        );
+        kind!(
+            modify_meta_ext,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Metadata(Some(
+                MetadataKind::Extended
+            ))))
+        );
+        kind!(
+            modify_meta_perm,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Metadata(Some(
+                MetadataKind::Permissions
+            ))))
+        );
+
+        kind!(
+            rename,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Name(None)))
+        );
+        kind!(
+            rename_any,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Name(Some(RenameMode::Any))))
+        );
+        kind!(
+            rename_other,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Name(Some(RenameMode::Other))))
+        );
+        kind!(
+            rename_from,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Name(Some(RenameMode::From))))
+        );
+        kind!(
+            rename_to,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Name(Some(RenameMode::To))))
+        );
+        kind!(
+            rename_both,
+            ExpectedEventKind::Modify(Some(ExpectedModifyKind::Name(Some(RenameMode::Both))))
+        );
+
+        kind!(create, ExpectedEventKind::Create(None));
+        kind!(create_any, ExpectedEventKind::Create(Some(CreateKind::Any)));
+        kind!(
+            create_other,
+            ExpectedEventKind::Create(Some(CreateKind::Other))
+        );
+        kind!(
+            create_file,
+            ExpectedEventKind::Create(Some(CreateKind::File))
+        );
+        kind!(
+            create_folder,
+            ExpectedEventKind::Create(Some(CreateKind::Folder))
+        );
+
+        kind!(remove, ExpectedEventKind::Remove(None));
+        kind!(remove_any, ExpectedEventKind::Remove(Some(RemoveKind::Any)));
+        kind!(
+            remove_other,
+            ExpectedEventKind::Remove(Some(RemoveKind::Other))
+        );
+        kind!(
+            remove_file,
+            ExpectedEventKind::Remove(Some(RemoveKind::File))
+        );
+        kind!(
+            remove_folder,
+            ExpectedEventKind::Remove(Some(RemoveKind::Folder))
+        );
+
+        kind!(access, ExpectedEventKind::Access(None));
+        kind!(
+            access_any,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Any))
+        );
+        kind!(
+            access_other,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Other))
+        );
+        kind!(
+            access_read,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Read))
+        );
+
+        kind!(
+            access_open,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Open(None)))
+        );
+        kind!(
+            access_open_any,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Open(Some(AccessMode::Any))))
+        );
+        kind!(
+            access_open_other,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Open(Some(AccessMode::Other))))
+        );
+        kind!(
+            access_open_read,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Open(Some(AccessMode::Read))))
+        );
+        kind!(
+            access_open_write,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Open(Some(AccessMode::Write))))
+        );
+        kind!(
+            access_open_execute,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Open(Some(AccessMode::Execute))))
+        );
+
+        kind!(
+            access_close,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Close(None)))
+        );
+        kind!(
+            access_close_any,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Close(Some(AccessMode::Any))))
+        );
+        kind!(
+            access_close_other,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Close(Some(AccessMode::Other))))
+        );
+        kind!(
+            access_close_read,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Close(Some(AccessMode::Read))))
+        );
+        kind!(
+            access_close_write,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Close(Some(AccessMode::Write))))
+        );
+        kind!(
+            access_close_execute,
+            ExpectedEventKind::Access(Some(ExpectedAccessKind::Close(Some(AccessMode::Execute))))
+        );
+
+        fn kind(mut self, kind: ExpectedEventKind) -> Self {
+            self.kind = Some(kind);
+            self
         }
     }
 }
 
-pub fn testdir() -> tempfile::TempDir {
-    tempfile::tempdir().expect("Unable to create tempdir")
+pub struct TestDir {
+    dir: tempfile::TempDir,
+    /// This is cacnonicalized path
+    /// due to macos behaviour - it creates
+    /// a dir with path '/var/...' but actualy it is '/private/var/...'
+    ///
+    /// Our watchers use canonicalized paths
+    /// and send events with canonicalized paths, tho we need it
+    path: PathBuf,
+}
+
+impl TestDir {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TestDir {
+    fn as_ref(&self) -> &Path {
+        self.path()
+    }
+}
+
+pub fn testdir() -> TestDir {
+    let dir = tempfile::tempdir().expect("Unable to create tempdir");
+    let path = std::fs::canonicalize(dir.path()).unwrap_or_else(|e| {
+        panic!(
+            "unable to canonicalize tempdir path {:?}: {e:?}",
+            dir.path()
+        )
+    });
+    TestDir { dir, path }
 }
 
 /// Creates a [`PollWatcher`] with comparable content and manual polling.
@@ -383,324 +850,81 @@ pub trait TestIteratorExt: Sized {
 
 impl<I: Iterator<Item = Event>> TestIteratorExt for I {}
 
-pub use actual_ctors::*;
-pub use expected_ctors::*;
-
 #[rustfmt::skip] // due to annoying macro invocations formatting 
-mod actual_ctors {
+pub mod filters {
     use notify_types::event::{
         AccessKind, AccessMode, CreateKind, DataChange, Event, EventKind, MetadataKind, ModifyKind,
         RemoveKind, RenameMode,
     };
 
-    use super::ExpectedEvent;
-
-    pub fn actual(event: Event) -> ExpectedEvent {
-        ExpectedEvent::from_event(event)
-    }
-
-    macro_rules! actual_if_matches {
+    macro_rules! filter {
         ($name: ident, $pattern:pat $(if $guard:expr)?) => {
-            pub fn $name(event: Event) -> Option<ExpectedEvent> {
-                actual_if(event, |kind| matches!(kind, $pattern $(if $guard)?))
+            pub fn $name(event: Event) -> bool {
+                filter_kind(event, |kind| matches!(kind, $pattern $(if $guard)?))
             }
         };
     }
     
-    fn actual_if(event: Event, f: impl FnOnce(EventKind) -> bool) -> Option<ExpectedEvent> {
+    fn filter_kind(event: Event, f: impl FnOnce(EventKind) -> bool) -> bool {
         if f(event.kind) {
-            Some(actual(event))
+            true
         } else {
-            None
+            false
         }
     }
 
-    actual_if_matches!(actual_any, EventKind::Any);
-    actual_if_matches!(actual_other, EventKind::Other);
-    actual_if_matches!(actual_create, EventKind::Create(_));
-    actual_if_matches!(actual_create_any, EventKind::Create(CreateKind::Any));
-    actual_if_matches!(actual_create_other, EventKind::Create(CreateKind::Other));
-    actual_if_matches!(actual_create_file, EventKind::Create(CreateKind::File));
-    actual_if_matches!(actual_create_folder, EventKind::Create(CreateKind::Folder));
+    filter!(any, EventKind::Any);
+    filter!(other, EventKind::Other);
+    filter!(create, EventKind::Create(_));
+    filter!(create_any, EventKind::Create(CreateKind::Any));
+    filter!(create_other, EventKind::Create(CreateKind::Other));
+    filter!(create_file, EventKind::Create(CreateKind::File));
+    filter!(create_folder, EventKind::Create(CreateKind::Folder));
 
-    actual_if_matches!(actual_remove, EventKind::Remove(_));
-    actual_if_matches!(actual_remove_any, EventKind::Remove(RemoveKind::Any));
-    actual_if_matches!(actual_remove_other, EventKind::Remove(RemoveKind::Other));
-    actual_if_matches!(actual_remove_file, EventKind::Remove(RemoveKind::File));
-    actual_if_matches!(actual_remove_folder, EventKind::Remove(RemoveKind::Folder));
+    filter!(remove, EventKind::Remove(_));
+    filter!(remove_any, EventKind::Remove(RemoveKind::Any));
+    filter!(remove_other, EventKind::Remove(RemoveKind::Other));
+    filter!(remove_file, EventKind::Remove(RemoveKind::File));
+    filter!(remove_folder, EventKind::Remove(RemoveKind::Folder));
 
-    actual_if_matches!(actual_modify, EventKind::Modify(_));
-    actual_if_matches!(actual_modify_any, EventKind::Modify(ModifyKind::Any));
-    actual_if_matches!(actual_modify_other, EventKind::Modify(ModifyKind::Other));
+    filter!(modify, EventKind::Modify(_));
+    filter!(modify_any, EventKind::Modify(ModifyKind::Any));
+    filter!(modify_other, EventKind::Modify(ModifyKind::Other));
 
-    actual_if_matches!(actual_modify_data, EventKind::Modify(ModifyKind::Data(_)));
-    actual_if_matches!(actual_modify_data_any, EventKind::Modify(ModifyKind::Data(DataChange::Any)));
-    actual_if_matches!(actual_modify_data_other, EventKind::Modify(ModifyKind::Data(DataChange::Other)));
-    actual_if_matches!(actual_modify_data_content, EventKind::Modify(ModifyKind::Data(DataChange::Content)));
-    actual_if_matches!(actual_modify_data_size, EventKind::Modify(ModifyKind::Data(DataChange::Size)));
+    filter!(modify_data, EventKind::Modify(ModifyKind::Data(_)));
+    filter!(modify_data_any, EventKind::Modify(ModifyKind::Data(DataChange::Any)));
+    filter!(modify_data_other, EventKind::Modify(ModifyKind::Data(DataChange::Other)));
+    filter!(modify_data_content, EventKind::Modify(ModifyKind::Data(DataChange::Content)));
+    filter!(modify_data_size, EventKind::Modify(ModifyKind::Data(DataChange::Size)));
 
-    actual_if_matches!(actual_modify_meta,EventKind::Modify(ModifyKind::Metadata(_)));
-    actual_if_matches!(actual_modify_meta_any,EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)));
-    actual_if_matches!(actual_modify_meta_other, EventKind::Modify(ModifyKind::Metadata(MetadataKind::Other)));
-    actual_if_matches!(actual_modify_meta_extended, EventKind::Modify(ModifyKind::Metadata(MetadataKind::Extended)));
-    actual_if_matches!(actual_modify_meta_owner, EventKind::Modify(ModifyKind::Metadata(MetadataKind::Ownership)));
-    actual_if_matches!(actual_modify_meta_perm, EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions)));
-    actual_if_matches!(actual_modify_meta_mtime, EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)));
-    actual_if_matches!(actual_modify_meta_atime, EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)));
+    filter!(modify_meta,EventKind::Modify(ModifyKind::Metadata(_)));
+    filter!(modify_meta_any,EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)));
+    filter!(modify_meta_other, EventKind::Modify(ModifyKind::Metadata(MetadataKind::Other)));
+    filter!(modify_meta_extended, EventKind::Modify(ModifyKind::Metadata(MetadataKind::Extended)));
+    filter!(modify_meta_owner, EventKind::Modify(ModifyKind::Metadata(MetadataKind::Ownership)));
+    filter!(modify_meta_perm, EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions)));
+    filter!(modify_meta_mtime, EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)));
+    filter!(modify_meta_atime, EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)));
 
-    actual_if_matches!(actual_rename, EventKind::Modify(ModifyKind::Name(_)));
-    actual_if_matches!(actual_rename_from, EventKind::Modify(ModifyKind::Name(RenameMode::From)));
-    actual_if_matches!(actual_rename_to, EventKind::Modify(ModifyKind::Name(RenameMode::To)));
-    actual_if_matches!(actual_rename_both, EventKind::Modify(ModifyKind::Name(RenameMode::Both)));
+    filter!(rename, EventKind::Modify(ModifyKind::Name(_)));
+    filter!(rename_from, EventKind::Modify(ModifyKind::Name(RenameMode::From)));
+    filter!(rename_to, EventKind::Modify(ModifyKind::Name(RenameMode::To)));
+    filter!(rename_both, EventKind::Modify(ModifyKind::Name(RenameMode::Both)));
 
-    actual_if_matches!(actual_access, EventKind::Access(_));
-    actual_if_matches!(actual_access_any, EventKind::Access(AccessKind::Any));
-    actual_if_matches!(actual_access_other, EventKind::Access(AccessKind::Other));
-    actual_if_matches!(actual_access_read, EventKind::Access(AccessKind::Read));
-    actual_if_matches!(actual_access_open, EventKind::Access(AccessKind::Open(_)));
-    actual_if_matches!(actual_access_open_any, EventKind::Access(AccessKind::Open(AccessMode::Any)));
-    actual_if_matches!(actual_access_open_other, EventKind::Access(AccessKind::Open(AccessMode::Other)));
-    actual_if_matches!(actual_access_open_read, EventKind::Access(AccessKind::Open(AccessMode::Read)));
-    actual_if_matches!(actual_access_open_write, EventKind::Access(AccessKind::Open(AccessMode::Write)));
-    actual_if_matches!(actual_access_open_exec, EventKind::Access(AccessKind::Open(AccessMode::Execute)));
-    actual_if_matches!(actual_access_close, EventKind::Access(AccessKind::Close(_)));
-    actual_if_matches!(actual_access_close_any, EventKind::Access(AccessKind::Close(AccessMode::Any)));
-    actual_if_matches!(actual_access_close_other, EventKind::Access(AccessKind::Close(AccessMode::Other)));
-    actual_if_matches!(actual_access_close_read, EventKind::Access(AccessKind::Close(AccessMode::Read)));
-    actual_if_matches!(actual_access_close_write, EventKind::Access(AccessKind::Close(AccessMode::Write)));
-    actual_if_matches!(actual_access_close_exec, EventKind::Access(AccessKind::Close(AccessMode::Execute)));
-}
-
-mod expected_ctors {
-    use std::path::Path;
-
-    use notify_types::event::{
-        AccessKind, AccessMode, CreateKind, DataChange, EventKind, MetadataKind, ModifyKind,
-        RemoveKind, RenameMode,
-    };
-
-    use crate::test::ExpectedEvent;
-
-    pub fn expected(kind: EventKind, path: impl AsRef<Path>) -> ExpectedEvent {
-        ExpectedEvent::with_path(kind, path)
-    }
-
-    pub fn expected_any(path: impl AsRef<Path>) -> ExpectedEvent {
-        ExpectedEvent::with_path(EventKind::Any, path)
-    }
-
-    pub fn expected_other(path: impl AsRef<Path>) -> ExpectedEvent {
-        ExpectedEvent::with_path(EventKind::Other, path)
-    }
-
-    pub fn expected_create(kind: CreateKind, path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Create(kind), path)
-    }
-
-    pub fn expected_create_any(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_create(CreateKind::Any, path)
-    }
-
-    pub fn expected_create_other(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_create(CreateKind::Other, path)
-    }
-
-    pub fn expected_create_file(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_create(CreateKind::File, path)
-    }
-
-    pub fn expected_create_folder(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_create(CreateKind::Folder, path)
-    }
-
-    pub fn expected_remove(kind: RemoveKind, path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Remove(kind), path)
-    }
-
-    pub fn expected_remove_any(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Remove(RemoveKind::Any), path)
-    }
-
-    pub fn expected_remove_other(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Remove(RemoveKind::Other), path)
-    }
-
-    pub fn expected_remove_file(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Remove(RemoveKind::File), path)
-    }
-
-    pub fn expected_remove_folder(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Remove(RemoveKind::Folder), path)
-    }
-
-    pub fn expected_modify(kind: ModifyKind, path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Modify(kind), path)
-    }
-
-    pub fn expected_modify_any(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Modify(ModifyKind::Any), path)
-    }
-
-    pub fn expected_modify_other(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Modify(ModifyKind::Other), path)
-    }
-
-    pub fn expected_modify_data(change: DataChange, path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Modify(ModifyKind::Data(change)), path)
-    }
-
-    pub fn expected_modify_data_any(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Modify(ModifyKind::Data(DataChange::Any)), path)
-    }
-
-    pub fn expected_modify_data_other(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Modify(ModifyKind::Data(DataChange::Other)), path)
-    }
-
-    pub fn expected_modify_data_content(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(
-            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
-            path,
-        )
-    }
-
-    pub fn expected_modify_data_size(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Modify(ModifyKind::Data(DataChange::Size)), path)
-    }
-
-    pub fn expected_modify_meta(kind: MetadataKind, path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Modify(ModifyKind::Metadata(kind)), path)
-    }
-
-    pub fn expected_modify_meta_any(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(
-            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
-            path,
-        )
-    }
-
-    pub fn expected_modify_meta_other(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(
-            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Other)),
-            path,
-        )
-    }
-
-    pub fn expected_modify_meta_atime(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(
-            EventKind::Modify(ModifyKind::Metadata(MetadataKind::AccessTime)),
-            path,
-        )
-    }
-
-    pub fn expected_modify_meta_mtime(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(
-            EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)),
-            path,
-        )
-    }
-
-    pub fn expected_modify_meta_extended(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(
-            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Extended)),
-            path,
-        )
-    }
-
-    pub fn expected_modify_meta_owner(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(
-            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Ownership)),
-            path,
-        )
-    }
-
-    pub fn expected_modify_meta_perm(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(
-            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions)),
-            path,
-        )
-    }
-
-    pub fn expected_rename(mode: RenameMode, path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_modify(ModifyKind::Name(mode), path)
-    }
-
-    pub fn expected_rename_any(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_rename(RenameMode::Any, path)
-    }
-
-    pub fn expected_rename_other(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_rename(RenameMode::Other, path)
-    }
-
-    pub fn expected_rename_from(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_rename(RenameMode::From, path)
-    }
-
-    pub fn expected_rename_to(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_rename(RenameMode::To, path)
-    }
-
-    pub fn expected_rename_both(from: impl AsRef<Path>, to: impl AsRef<Path>) -> ExpectedEvent {
-        ExpectedEvent {
-            kind: EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
-            paths: vec![from.as_ref().to_path_buf(), to.as_ref().to_path_buf()],
-        }
-    }
-
-    pub fn expected_access(kind: AccessKind, path: impl AsRef<Path>) -> ExpectedEvent {
-        expected(EventKind::Access(kind), path)
-    }
-
-    pub fn expected_open(mode: AccessMode, path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_access(AccessKind::Open(mode), path)
-    }
-
-    pub fn expected_open_any(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_access(AccessKind::Open(AccessMode::Any), path)
-    }
-
-    pub fn expected_open_other(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_access(AccessKind::Open(AccessMode::Other), path)
-    }
-
-    pub fn expected_open_read(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_access(AccessKind::Open(AccessMode::Read), path)
-    }
-
-    pub fn expected_open_write(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_access(AccessKind::Open(AccessMode::Write), path)
-    }
-
-    pub fn expected_open_exec(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_access(AccessKind::Open(AccessMode::Execute), path)
-    }
-
-    pub fn expected_close(mode: AccessMode, path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_access(AccessKind::Close(mode), path)
-    }
-
-    pub fn expected_close_any(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_access(AccessKind::Close(AccessMode::Any), path)
-    }
-
-    pub fn expected_close_other(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_access(AccessKind::Close(AccessMode::Other), path)
-    }
-
-    pub fn expected_close_read(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_access(AccessKind::Close(AccessMode::Read), path)
-    }
-
-    pub fn expected_close_write(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_access(AccessKind::Close(AccessMode::Write), path)
-    }
-
-    pub fn expected_close_exec(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_access(AccessKind::Close(AccessMode::Execute), path)
-    }
-
-    pub fn expected_read(path: impl AsRef<Path>) -> ExpectedEvent {
-        expected_access(AccessKind::Read, path)
-    }
+    filter!(access, EventKind::Access(_));
+    filter!(access_any, EventKind::Access(AccessKind::Any));
+    filter!(access_other, EventKind::Access(AccessKind::Other));
+    filter!(access_read, EventKind::Access(AccessKind::Read));
+    filter!(access_open, EventKind::Access(AccessKind::Open(_)));
+    filter!(access_open_any, EventKind::Access(AccessKind::Open(AccessMode::Any)));
+    filter!(access_open_other, EventKind::Access(AccessKind::Open(AccessMode::Other)));
+    filter!(access_open_read, EventKind::Access(AccessKind::Open(AccessMode::Read)));
+    filter!(access_open_write, EventKind::Access(AccessKind::Open(AccessMode::Write)));
+    filter!(access_open_exec, EventKind::Access(AccessKind::Open(AccessMode::Execute)));
+    filter!(access_close, EventKind::Access(AccessKind::Close(_)));
+    filter!(access_close_any, EventKind::Access(AccessKind::Close(AccessMode::Any)));
+    filter!(access_close_other, EventKind::Access(AccessKind::Close(AccessMode::Other)));
+    filter!(access_close_read, EventKind::Access(AccessKind::Close(AccessMode::Read)));
+    filter!(access_close_write, EventKind::Access(AccessKind::Close(AccessMode::Write)));
+    filter!(access_close_exec, EventKind::Access(AccessKind::Close(AccessMode::Execute)));
 }

@@ -624,6 +624,10 @@ mod tests {
     use crate::test::*;
     use pretty_assertions::assert_eq;
 
+    fn watcher() -> (TestWatcher<INotifyWatcher>, Receiver) {
+        channel()
+    }
+
     /// see [`INotifyIteratorExt::unflakyfy`]
     struct Unflakyfy<I: Iterator> {
         inner: Peekable<I>,
@@ -836,7 +840,7 @@ mod tests {
     #[test]
     fn create_file() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
         watcher.watch_recursively(&tmpdir);
 
         let path = tmpdir.path().join("entry");
@@ -848,7 +852,7 @@ mod tests {
     #[test]
     fn write_file() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let path = tmpdir.path().join("entry");
         std::fs::File::create_new(&path).expect("create");
@@ -862,7 +866,7 @@ mod tests {
     #[test]
     fn chmod_file() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let path = tmpdir.path().join("entry");
         let file = std::fs::File::create_new(&path).expect("create");
@@ -878,7 +882,7 @@ mod tests {
     #[test]
     fn rename_file() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let path = tmpdir.path().join("entry");
         std::fs::File::create_new(&path).expect("create");
@@ -909,7 +913,7 @@ mod tests {
     #[test]
     fn delete_file() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
         let file = tmpdir.path().join("file");
         std::fs::write(&file, "").expect("write");
 
@@ -928,7 +932,7 @@ mod tests {
     #[test]
     fn delete_self_file() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
         let file = tmpdir.path().join("file");
         std::fs::write(&file, "").expect("write");
 
@@ -948,7 +952,7 @@ mod tests {
     #[test]
     fn create_write_overwrite() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
         let overwritten_file = tmpdir.path().join("overwritten_file");
         let overwriting_file = tmpdir.path().join("overwriting_file");
         std::fs::write(&overwritten_file, "123").expect("write1");
@@ -985,7 +989,7 @@ mod tests {
     #[test]
     fn create_dir() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
         watcher.watch_recursively(&tmpdir);
 
         let path = tmpdir.path().join("entry");
@@ -997,7 +1001,7 @@ mod tests {
     #[test]
     fn chmod_dir() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let path = tmpdir.path().join("entry");
         std::fs::create_dir(&path).expect("create_dir");
@@ -1013,7 +1017,7 @@ mod tests {
     #[test]
     fn rename_dir() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let path = tmpdir.path().join("entry");
         let new_path = tmpdir.path().join("new_path");
@@ -1045,7 +1049,7 @@ mod tests {
     #[test]
     fn delete_dir() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let path = tmpdir.path().join("entry");
         std::fs::create_dir(&path).expect("create_dir");
@@ -1061,7 +1065,7 @@ mod tests {
     #[test]
     fn rename_dir_twice() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let path = tmpdir.path().join("entry");
         let new_path = tmpdir.path().join("new_path");
@@ -1098,7 +1102,7 @@ mod tests {
     fn move_out_of_watched_dir() {
         let tmpdir = testdir();
         let subdir = tmpdir.path().join("subdir");
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let path = subdir.join("entry");
         std::fs::create_dir_all(&subdir).expect("create_dir_all");
@@ -1119,7 +1123,7 @@ mod tests {
     #[test]
     fn create_write_write_rename_write_remove() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let file1 = tmpdir.path().join("entry");
         let file2 = tmpdir.path().join("entry2");
@@ -1159,7 +1163,7 @@ mod tests {
     #[test]
     fn rename_twice() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let path = tmpdir.path().join("entry");
         std::fs::File::create_new(&path).expect("create");
@@ -1204,7 +1208,7 @@ mod tests {
     #[test]
     fn set_file_mtime() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let path = tmpdir.path().join("entry");
         let file = std::fs::File::create_new(&path).expect("create");
@@ -1225,7 +1229,7 @@ mod tests {
     #[test]
     fn write_file_non_recursive_watch() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let path = tmpdir.path().join("entry");
         std::fs::File::create_new(&path).expect("create");
@@ -1242,7 +1246,7 @@ mod tests {
     #[test]
     fn watch_recursively_then_unwatch_child_stops_events_from_child() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let subdir = tmpdir.path().join("subdir");
         let file = subdir.join("file");
@@ -1273,7 +1277,7 @@ mod tests {
     #[test]
     fn write_to_a_hardlink_pointed_to_the_watched_file_triggers_an_event() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let subdir = tmpdir.path().join("subdir");
         let file = subdir.join("file");
@@ -1294,7 +1298,7 @@ mod tests {
     #[test]
     fn write_to_a_hardlink_pointed_to_the_file_in_the_watched_dir_doesnt_trigger_an_event() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         let subdir = tmpdir.path().join("subdir");
         let file = subdir.join("file");
@@ -1326,7 +1330,7 @@ mod tests {
         let nested8 = tmpdir.path().join("1/2/3/4/5/6/7/8");
         let nested9 = tmpdir.path().join("1/2/3/4/5/6/7/8/9");
 
-        let (mut watcher, mut rx) = channel::<INotifyWatcher>();
+        let (mut watcher, mut rx) = watcher();
 
         watcher.watch_recursively(&tmpdir);
 

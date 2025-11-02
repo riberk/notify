@@ -677,8 +677,6 @@ impl Drop for PollWatcher {
 
 #[cfg(test)]
 mod tests {
-    use notify_types::event::{CreateKind, DataChange, EventKind, ModifyKind, RemoveKind};
-
     use super::PollWatcher;
     use crate::test::*;
 
@@ -697,7 +695,7 @@ mod tests {
         let path = tmpdir.path().join("entry");
         std::fs::File::create_new(&path).expect("Unable to create");
 
-        rx.wait_exact([expected(EventKind::Create(CreateKind::Any), &path)]);
+        rx.wait_ordered_exact([expected(&path).create_any()]);
     }
 
     #[test]
@@ -709,7 +707,7 @@ mod tests {
         let path = tmpdir.path().join("entry");
         std::fs::create_dir(&path).expect("Unable to create");
 
-        rx.wait_exact([expected(EventKind::Create(CreateKind::Any), &path)]);
+        rx.wait_ordered_exact([expected(&path).create_any()]);
     }
 
     #[test]
@@ -722,10 +720,7 @@ mod tests {
         watcher.watch_recursively(&tmpdir);
         std::fs::write(&path, b"123").expect("Unable to write");
 
-        rx.wait_exact([expected(
-            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
-            &path,
-        )]);
+        rx.wait_ordered_exact([expected(&path).modify_data_any()]);
     }
 
     #[test]
@@ -738,6 +733,6 @@ mod tests {
         watcher.watch_recursively(&tmpdir);
         std::fs::remove_file(&path).expect("Unable to remove");
 
-        rx.wait_exact([expected(EventKind::Remove(RemoveKind::Any), &path)]);
+        rx.wait_ordered_exact([expected(&path).remove_any()]);
     }
 }

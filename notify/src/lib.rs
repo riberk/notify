@@ -456,7 +456,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        Config, Error, ErrorKind, Event, EventKind, NullWatcher, PollWatcher, RecommendedWatcher,
+        Config, Error, ErrorKind, Event, NullWatcher, PollWatcher, RecommendedWatcher,
         RecursiveMode, Result, Watcher, WatcherKind,
     };
     use crate::test::*;
@@ -630,7 +630,7 @@ mod tests {
         let path = tmpdir.path().join("entry");
         std::fs::File::create_new(&path).expect("create");
 
-        rx.wait_event(|e| matches!(e.kind, EventKind::Create(_)) && e.paths.first() == Some(&path));
+        rx.wait_unordered([expected(path).create()]);
     }
 
     #[test]
@@ -642,7 +642,7 @@ mod tests {
         let path = tmpdir.path().join("entry");
         std::fs::create_dir(&path).expect("create");
 
-        rx.wait_event(|e| matches!(e.kind, EventKind::Create(_)) && e.paths.first() == Some(&path));
+        rx.wait_unordered([expected(path).create()]);
     }
 
     #[test]
@@ -656,7 +656,7 @@ mod tests {
         watcher.watch_recursively(&tmpdir);
         std::fs::write(&path, b"123").expect("write");
 
-        rx.wait_event(|e| matches!(e.kind, EventKind::Modify(_)) && e.paths.first() == Some(&path));
+        rx.wait_unordered([expected(path).modify()]);
     }
 
     #[test]
@@ -670,6 +670,6 @@ mod tests {
         watcher.watch_recursively(&tmpdir);
         std::fs::remove_file(&path).expect("remove");
 
-        rx.wait_event(|e| matches!(e.kind, EventKind::Remove(_)) && e.paths.first() == Some(&path));
+        rx.wait_unordered([expected(path).remove()]);
     }
 }
