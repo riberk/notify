@@ -614,85 +614,19 @@ impl Drop for INotifyWatcher {
 #[cfg(test)]
 mod tests {
     use std::{
-        iter::Peekable,
-        sync::{atomic::AtomicBool, mpsc},
-        thread::available_parallelism,
+        path::{Path, PathBuf},
+        sync::{atomic::AtomicBool, mpsc, Arc},
+        thread::{self, available_parallelism},
         time::Duration,
     };
 
-    use super::*;
+    use super::{Config, Error, ErrorKind, Event, INotifyWatcher, RecursiveMode, Result, Watcher};
+
     use crate::test::*;
-    use pretty_assertions::assert_eq;
 
     fn watcher() -> (TestWatcher<INotifyWatcher>, Receiver) {
         channel()
     }
-
-    /// see [`INotifyIteratorExt::unflakyfy`]
-    struct Unflakyfy<I: Iterator> {
-        inner: Peekable<I>,
-        skip_if_eq: Option<Event>,
-    }
-
-    impl<I> Iterator for Unflakyfy<I>
-    where
-        I: Iterator<Item = Event>,
-    {
-        type Item = Event;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            loop {
-                let event = self.inner.next()?;
-
-                if self
-                    .skip_if_eq
-                    .as_ref()
-                    .is_some_and(|skip| skip.kind == event.kind && skip.paths == event.paths)
-                {
-                    continue;
-                } else {
-                    self.skip_if_eq = None;
-                }
-
-                if matches!(
-                    event.kind,
-                    EventKind::Modify(ModifyKind::Name(RenameMode::Both))
-                ) {
-                    continue;
-                }
-
-                if matches!(
-                    event.kind,
-                    EventKind::Modify(ModifyKind::Data(DataChange::Any))
-                ) {
-                    self.skip_if_eq = Some(event.clone());
-                }
-
-                break Some(event);
-            }
-        }
-    }
-
-    trait INotifyIteratorExt: Iterator<Item = Event> {
-        /// Make events less flaky:
-        /// * ignores RenameMode::Both: that kind of an event requires the both
-        ///   (RenameMode::From and RenameMode::To) events are read in the same batch,
-        ///   but this is not guaranteed.
-        /// * merges sequence of Modify(Data(Any)) with the same paths into the one event:
-        ///   data modification may trigger more than one event
-        ///   [due to multiple syscalls](https://man7.org/linux/man-pages/man2/write.2.html).
-        fn unflakyfy(self) -> Unflakyfy<Self>
-        where
-            Self: Sized,
-        {
-            Unflakyfy {
-                inner: self.peekable(),
-                skip_if_eq: None,
-            }
-        }
-    }
-
-    impl<I: Iterator<Item = Event>> INotifyIteratorExt for I {}
 
     #[test]
     fn inotify_watcher_is_send_and_sync() {
@@ -846,7 +780,11 @@ mod tests {
         let path = tmpdir.path().join("entry");
         std::fs::File::create_new(&path).expect("create");
 
-        rx.wait([expected_create_file(&path)]);
+        rx.wait_ordered_exact([
+            expected(&path).create_file(),
+            expected(&path).access_open_any(),
+            expected(&path).access_close_write(),
+        ]);
     }
 
     #[test]
@@ -860,7 +798,12 @@ mod tests {
         watcher.watch_recursively(&tmpdir);
         std::fs::write(&path, b"123").expect("write");
 
-        rx.wait([expected_modify_data_any(&path)]);
+        rx.wait_ordered_exact([
+            expected(&path).access_open_any(),
+            expected(&path).modify_data_any().multiple(),
+            expected(&path).access_close_write(),
+        ])
+        .ensure_no_tail();
     }
 
     #[test]
@@ -876,7 +819,7 @@ mod tests {
         watcher.watch_recursively(&tmpdir);
         file.set_permissions(permissions).expect("set_permissions");
 
-        rx.wait([expected_modify_meta_any(&path)]);
+        rx.wait_ordered_exact([expected(&path).modify_meta_any()]);
     }
 
     #[test]
@@ -892,22 +835,13 @@ mod tests {
 
         std::fs::rename(&path, &new_path).expect("rename");
 
-        let mut cookies = Default::default();
-        let events = rx
-            .iter()
-            .store_cookies(&mut cookies)
-            .take(2)
-            .map(|e| (e.attrs.tracker(), actual(e)))
-            .collect::<Vec<_>>();
-
-        cookies.ensure_len(1, &events);
-        assert_eq!(
-            &events,
-            &[
-                (Some(cookies[0]), expected_rename_from(path)),
-                (Some(cookies[0]), expected_rename_to(new_path)),
-            ]
-        );
+        rx.wait_ordered_exact([
+            expected(&path).rename_from(),
+            expected(&new_path).rename_to(),
+            expected([path, new_path]).rename_both(),
+        ])
+        .ensure_trackers_len(1)
+        .ensure_no_tail();
     }
 
     #[test]
@@ -921,14 +855,9 @@ mod tests {
 
         std::fs::remove_file(&file).expect("remove");
 
-        let remove = rx
-            .iter()
-            .filter_map(actual_remove_file)
-            .next()
-            .expect("no one remove event");
-
-        assert_eq!(remove, expected_remove_file(&file));
+        rx.wait_ordered_exact([expected(&file).remove_file()]);
     }
+
     #[test]
     fn delete_self_file() {
         let tmpdir = testdir();
@@ -940,13 +869,10 @@ mod tests {
 
         std::fs::remove_file(&file).expect("remove");
 
-        let remove = rx
-            .iter()
-            .filter_map(actual_remove_file)
-            .next()
-            .expect("no one remove event");
-
-        assert_eq!(remove, expected_remove_file(&file));
+        rx.wait_ordered_exact([
+            expected(&file).modify_meta_any(),
+            expected(&file).remove_file(),
+        ]);
     }
 
     #[test]
@@ -963,27 +889,19 @@ mod tests {
         std::fs::write(&overwriting_file, "321").expect("write2");
         std::fs::rename(&overwriting_file, &overwritten_file).expect("rename");
 
-        let mut cookies = Default::default();
-
-        let events = rx
-            .iter()
-            .unflakyfy()
-            .ignore_access()
-            .take(4)
-            .store_cookies(&mut cookies)
-            .map(|e| (e.attrs.tracker(), actual(e)))
-            .collect::<Vec<_>>();
-
-        cookies.ensure_len(1, &events);
-        assert_eq!(
-            &events,
-            &[
-                (None, expected_create_file(&overwriting_file)),
-                (None, expected_modify_data_any(&overwriting_file)),
-                (Some(cookies[0]), expected_rename_from(&overwriting_file)),
-                (Some(cookies[0]), expected_rename_to(&overwritten_file)),
-            ]
-        );
+        rx.wait_ordered_exact([
+            expected(&overwriting_file).create_file(),
+            expected(&overwriting_file).access_open_any(),
+            expected(&overwriting_file).access_close_write(),
+            expected(&overwriting_file).access_open_any(),
+            expected(&overwriting_file).modify_data_any().multiple(),
+            expected(&overwriting_file).access_close_write(),
+            expected(&overwriting_file).rename_from(),
+            expected(&overwritten_file).rename_to(),
+            expected([overwriting_file, overwritten_file]).rename_both(),
+        ])
+        .ensure_no_tail()
+        .ensure_trackers_len(1);
     }
 
     #[test]
@@ -995,7 +913,8 @@ mod tests {
         let path = tmpdir.path().join("entry");
         std::fs::create_dir(&path).expect("create");
 
-        rx.wait([expected_create_folder(&path)]);
+        rx.wait_ordered_exact([expected(&path).create_folder()])
+            .ensure_no_tail();
     }
 
     #[test]
@@ -1011,7 +930,12 @@ mod tests {
         watcher.watch_recursively(&tmpdir);
         std::fs::set_permissions(&path, permissions).expect("set_permissions");
 
-        rx.wait([expected_modify_meta_any(&path)]);
+        rx.wait_ordered_exact([
+            expected(&path).access_open_any().optional(),
+            expected(&path).modify_meta_any(),
+            expected(&path).modify_meta_any(),
+        ])
+        .ensure_no_tail();
     }
 
     #[test]
@@ -1024,26 +948,17 @@ mod tests {
         std::fs::create_dir(&path).expect("create_dir");
 
         watcher.watch_recursively(&tmpdir);
+
         std::fs::rename(&path, &new_path).expect("rename");
 
-        let mut cookies = Default::default();
-        let events = rx
-            .iter()
-            .unflakyfy()
-            .ignore_access()
-            .take(2)
-            .store_cookies(&mut cookies)
-            .map(|e| (e.attrs.tracker(), actual(e)))
-            .collect::<Vec<_>>();
-
-        cookies.ensure_len(1, &events);
-        assert_eq!(
-            &events,
-            &[
-                (Some(cookies[0]), expected_rename_from(&path)),
-                (Some(cookies[0]), expected_rename_to(&new_path)),
-            ]
-        );
+        rx.wait_ordered_exact([
+            expected(&path).access_open_any().optional(),
+            expected(&path).rename_from(),
+            expected(&new_path).rename_to(),
+            expected([path, new_path]).rename_both(),
+        ])
+        .ensure_trackers_len(1)
+        .ensure_no_tail();
     }
 
     #[test]
@@ -1057,9 +972,11 @@ mod tests {
         watcher.watch_recursively(&tmpdir);
         std::fs::remove_dir(&path).expect("remove");
 
-        let event = rx.iter().unflakyfy().ignore_access().map(actual).next();
-
-        assert_eq!(event, Some(expected_remove_folder(&path)));
+        rx.wait_ordered_exact([
+            expected(&path).access_open_any().optional(),
+            expected(&path).remove_folder(),
+        ])
+        .ensure_no_tail();
     }
 
     #[test]
@@ -1076,26 +993,17 @@ mod tests {
         std::fs::rename(&path, &new_path).expect("rename");
         std::fs::rename(&new_path, &new_path2).expect("rename2");
 
-        let mut cookies = Default::default();
-        let events = rx
-            .iter()
-            .unflakyfy()
-            .ignore_access()
-            .take(4)
-            .store_cookies(&mut cookies)
-            .map(|e| (e.attrs.tracker(), actual(e)))
-            .collect::<Vec<_>>();
-
-        cookies.ensure_len(2, &events);
-        assert_eq!(
-            &events,
-            &[
-                (Some(cookies[0]), expected_rename_from(&path)),
-                (Some(cookies[0]), expected_rename_to(&new_path)),
-                (Some(cookies[1]), expected_rename_from(&new_path)),
-                (Some(cookies[1]), expected_rename_to(&new_path2)),
-            ]
-        );
+        rx.wait_ordered_exact([
+            expected(&path).access_open_any().optional(),
+            expected(&path).rename_from(),
+            expected(&new_path).rename_to(),
+            expected([&path, &new_path]).rename_both(),
+            expected(&new_path).rename_from(),
+            expected(&new_path2).rename_to(),
+            expected([&new_path, &new_path2]).rename_both(),
+        ])
+        .ensure_no_tail()
+        .ensure_trackers_len(2);
     }
 
     #[test]
@@ -1114,9 +1022,9 @@ mod tests {
         std::fs::rename(&path, &new_path).expect("rename");
 
         let event = rx.recv();
-        let cookie = event.attrs.tracker();
-        assert_eq!(actual(event.clone()), expected_rename_from(path));
-        assert!(cookie.is_some(), "cookie is none: [event:#?]");
+        let tracker = event.attrs.tracker();
+        assert_eq!(event, expected(path).rename_from());
+        assert!(tracker.is_some(), "tracker is none: [event:#?]");
         rx.ensure_empty();
     }
 
@@ -1137,27 +1045,23 @@ mod tests {
         std::fs::write(&new_path, b"1").expect("write 3");
         std::fs::remove_file(&new_path).expect("remove");
 
-        let mut events = Vec::new();
-        for event in rx.iter().unflakyfy().ignore_access() {
-            let last_event = event.kind.is_remove();
-            events.push(actual(event));
-            if last_event {
-                break;
-            }
-        }
-
-        assert_eq!(
-            &events,
-            &[
-                expected_create_file(&file1),
-                expected_modify_data_any(&file1),
-                expected_modify_data_any(&file2),
-                expected_rename_from(&file1),
-                expected_rename_to(&new_path),
-                expected_modify_data_any(&new_path),
-                expected_remove_file(&new_path),
-            ]
-        )
+        rx.wait_ordered_exact([
+            expected(&file1).create_file(),
+            expected(&file1).access_open_any(),
+            expected(&file1).modify_data_any().multiple(),
+            expected(&file1).access_close_write(),
+            expected(&file2).access_open_any(),
+            expected(&file2).modify_data_any().multiple(),
+            expected(&file2).access_close_write(),
+            expected(&file1).access_open_any().optional(),
+            expected(&file1).rename_from(),
+            expected(&new_path).rename_to(),
+            expected([&file1, &new_path]).rename_both(),
+            expected(&new_path).access_open_any(),
+            expected(&new_path).modify_data_any().multiple(),
+            expected(&new_path).access_close_write(),
+            expected(&new_path).remove_file(),
+        ]);
     }
 
     #[test]
@@ -1175,34 +1079,18 @@ mod tests {
         std::fs::rename(&path, &new_path1).expect("rename1");
         std::fs::rename(&new_path1, &new_path2).expect("rename2");
 
-        let mut events = Vec::new();
-        let mut cookies = Default::default();
-        for event in rx
-            .iter()
-            .unflakyfy()
-            .ignore_access()
-            .store_cookies(&mut cookies)
-        {
-            let last_event =
-                event.kind.is_modify() && event.paths.first().is_some_and(|p| p == &new_path2);
-
-            events.push((event.tracker(), actual(event)));
-            if last_event {
-                break;
-            }
-        }
-
-        assert_eq!(cookies.len(), 2, "unexpected cookies len. {events:#?}");
-
-        assert_eq!(
-            &events,
-            &[
-                (Some(cookies[0]), expected_rename_from(&path)),
-                (Some(cookies[0]), expected_rename_to(&new_path1)),
-                (Some(cookies[1]), expected_rename_from(&new_path1)),
-                (Some(cookies[1]), expected_rename_to(&new_path2)),
-            ]
-        );
+        rx.wait_ordered_exact([
+            expected(&path).access_open_any().optional(),
+            expected(&path).rename_from(),
+            expected(&new_path1).rename_to(),
+            expected([&path, &new_path1]).rename_both(),
+            expected(&new_path1).access_open_any().optional(),
+            expected(&new_path1).rename_from(),
+            expected(&new_path2).rename_to(),
+            expected([&new_path1, &new_path2]).rename_both(),
+        ])
+        .ensure_no_tail()
+        .ensure_trackers_len(2);
     }
 
     #[test]
@@ -1222,7 +1110,7 @@ mod tests {
         )
         .expect("set_time");
 
-        assert_eq!(actual(rx.recv()), expected_modify_data_any(&path));
+        assert_eq!(rx.recv(), expected(&path).modify_data_any());
         rx.ensure_empty();
     }
 
@@ -1238,9 +1126,12 @@ mod tests {
 
         std::fs::write(&path, b"123").expect("write");
 
-        let actual = rx.iter().filter_map(actual_modify).next();
-
-        assert_eq!(actual, Some(expected_modify_data_any(&path)));
+        rx.wait_ordered_exact([
+            expected(&path).access_open_any(),
+            expected(&path).modify_data_any().multiple(),
+            expected(&path).access_close_write(),
+        ])
+        .ensure_no_tail();
     }
 
     #[test]
@@ -1256,8 +1147,13 @@ mod tests {
 
         std::fs::File::create(&file).expect("create");
 
-        let event = rx.iter().filter_map(actual_create).next();
-        assert_eq!(event, Some(expected_create_file(&file)));
+        rx.wait_ordered_exact([
+            expected(&subdir).access_open_any().optional(),
+            expected(&file).create_file(),
+            expected(&file).access_open_any(),
+            expected(&file).access_close_write(),
+        ])
+        .ensure_no_tail();
 
         watcher.watcher.unwatch(&subdir).expect("unwatch");
 
@@ -1265,13 +1161,11 @@ mod tests {
 
         std::fs::remove_dir_all(&subdir).expect("remove_dir_all");
 
-        let remain = rx
-            .iter()
-            .unflakyfy()
-            .ignore_access()
-            .map(actual)
-            .collect::<Vec<_>>();
-        assert_eq!(&remain, &[expected_remove_folder(&subdir)]);
+        rx.wait_ordered_exact([
+            expected(&subdir).access_open_any().optional(),
+            expected(&subdir).remove_folder(),
+        ])
+        .ensure_no_tail();
     }
 
     #[test]
@@ -1291,8 +1185,11 @@ mod tests {
 
         std::fs::write(&hardlink, "123123").expect("write to the hard link");
 
-        let modify = rx.iter().unflakyfy().ignore_access().map(actual).next();
-        assert_eq!(modify, Some(expected_modify_data_any(&file)),)
+        rx.wait_ordered_exact([
+            expected(&file).access_open_any(),
+            expected(&file).modify_data_any().multiple(),
+            expected(&file).access_close_write(),
+        ]);
     }
 
     #[test]
@@ -1335,30 +1232,16 @@ mod tests {
         watcher.watch_recursively(&tmpdir);
 
         std::fs::create_dir_all(&nested9).expect("create_dir_all");
-
-        let mut events = Vec::new();
-        for event in rx.iter().filter(|e| !e.kind.is_access()) {
-            let last_event =
-                event.kind.is_create() && event.paths.first().is_some_and(|p| p == &nested9);
-            events.push(actual(event));
-            if last_event {
-                break;
-            }
-        }
-
-        assert_eq!(
-            &events,
-            &[
-                expected_create_folder(&nested1),
-                expected_create_folder(&nested2),
-                expected_create_folder(&nested3),
-                expected_create_folder(&nested4),
-                expected_create_folder(&nested5),
-                expected_create_folder(&nested6),
-                expected_create_folder(&nested7),
-                expected_create_folder(&nested8),
-                expected_create_folder(&nested9),
-            ]
-        )
+        rx.wait_ordered([
+            expected(&nested1).create_folder(),
+            expected(&nested2).create_folder(),
+            expected(&nested3).create_folder(),
+            expected(&nested4).create_folder(),
+            expected(&nested5).create_folder(),
+            expected(&nested6).create_folder(),
+            expected(&nested7).create_folder(),
+            expected(&nested8).create_folder(),
+            expected(&nested9).create_folder(),
+        ]);
     }
 }
