@@ -680,6 +680,10 @@ mod tests {
     use super::PollWatcher;
     use crate::test::*;
 
+    fn watcher() -> (TestWatcher<PollWatcher>, Receiver) {
+        poll_watcher()
+    }
+
     #[test]
     fn poll_watcher_is_send_and_sync() {
         fn check<T: Send + Sync>() {}
@@ -689,7 +693,7 @@ mod tests {
     #[test]
     fn create_file() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = poll_watcher();
+        let (mut watcher, mut rx) = watcher();
         watcher.watch_recursively(&tmpdir);
 
         let path = tmpdir.path().join("entry");
@@ -701,7 +705,7 @@ mod tests {
     #[test]
     fn create_dir() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = poll_watcher();
+        let (mut watcher, mut rx) = watcher();
         watcher.watch_recursively(&tmpdir);
 
         let path = tmpdir.path().join("entry");
@@ -713,7 +717,7 @@ mod tests {
     #[test]
     fn modify_file() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = poll_watcher();
+        let (mut watcher, mut rx) = watcher();
         let path = tmpdir.path().join("entry");
         std::fs::File::create_new(&path).expect("Unable to create");
 
@@ -726,7 +730,7 @@ mod tests {
     #[test]
     fn remove_file() {
         let tmpdir = testdir();
-        let (mut watcher, mut rx) = poll_watcher();
+        let (mut watcher, mut rx) = watcher();
         let path = tmpdir.path().join("entry");
         std::fs::File::create_new(&path).expect("Unable to create");
 
@@ -734,5 +738,39 @@ mod tests {
         std::fs::remove_file(&path).expect("Unable to remove");
 
         rx.wait_ordered_exact([expected(&path).remove_any()]);
+    }
+
+    #[test]
+    fn rename_file() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = watcher();
+        let path = tmpdir.path().join("entry");
+        let new_path = tmpdir.path().join("new_entry");
+        std::fs::File::create_new(&path).expect("Unable to create");
+
+        watcher.watch_recursively(&tmpdir);
+        std::fs::rename(&path, &new_path).expect("Unable to remove");
+
+        rx.wait_unordered_exact([
+            expected(&path).remove_any(),
+            expected(&new_path).create_any(),
+        ]);
+    }
+
+    #[test]
+    fn create_write_overwrite() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = poll_watcher();
+        let overwritten_file = tmpdir.path().join("overwritten_file");
+        let overwriting_file = tmpdir.path().join("overwriting_file");
+        std::fs::write(&overwritten_file, "123").expect("write1");
+
+        watcher.watch_nonrecursively(&tmpdir);
+
+        std::fs::File::create(&overwriting_file).expect("create");
+        std::fs::write(&overwriting_file, "321").expect("write2");
+        std::fs::rename(&overwriting_file, &overwritten_file).expect("rename");
+
+        rx.wait_unordered_exact([expected(&overwritten_file).modify_data_any()]);
     }
 }

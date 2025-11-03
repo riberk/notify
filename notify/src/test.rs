@@ -1,3 +1,5 @@
+#![allow(dead_code)] // not all helpers are used for all targets
+
 use std::{
     fmt::Debug,
     ops::Deref,
@@ -56,7 +58,6 @@ impl Receiver {
     }
 
     /// Waits for the events in the same order as they provided and fails on an unexpected one.
-    #[allow(dead_code)]
     pub fn wait_ordered_exact(
         &mut self,
         expected: impl IntoIterator<Item = ExpectedEvent>,
@@ -65,13 +66,11 @@ impl Receiver {
     }
 
     /// Waits for the events in the same order as they provided and ignores unexpected ones.
-    #[allow(dead_code)]
     pub fn wait_ordered(&mut self, expected: impl IntoIterator<Item = ExpectedEvent>) -> WaitState {
         self.wait_expected(ExpectedState::ordered(expected).allow_unexpected())
     }
 
     /// Waits for the events in any order and fails on an unexpected one.
-    #[allow(dead_code)]
     pub fn wait_unordered_exact(
         &mut self,
         expected: impl IntoIterator<Item = ExpectedEvent>,
@@ -80,7 +79,6 @@ impl Receiver {
     }
 
     /// Waits for the events in any order and ignores unexpected ones.
-    #[allow(dead_code)]
     pub fn wait_unordered(
         &mut self,
         expected: impl IntoIterator<Item = ExpectedEvent>,

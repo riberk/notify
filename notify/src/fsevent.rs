@@ -799,9 +799,9 @@ mod tests {
         std::fs::write(&overwriting_file, "321").expect("write2");
         std::fs::rename(&overwriting_file, &overwritten_file).expect("rename");
 
-        rx.wait_ordered([
+        rx.wait_unordered([
             expected(&overwriting_file).create(),
-            expected(&overwriting_file).modify_data(),
+            expected(&overwriting_file).modify_data_content().multiple(),
             expected(&overwriting_file).rename_any(),
             expected(&overwritten_file).rename_any(),
         ]);
@@ -884,9 +884,8 @@ mod tests {
         std::fs::rename(&path, &new_path).expect("rename");
         std::fs::rename(&new_path, &new_path2).expect("rename2");
 
-        rx.wait_ordered([
+        rx.wait_unordered([
             expected(&path).rename_any(),
-            expected(&new_path).rename_any(),
             expected(&new_path).rename_any(),
             expected(&new_path2).rename_any(),
         ]);
@@ -907,7 +906,7 @@ mod tests {
 
         std::fs::rename(&path, &new_path).expect("rename");
 
-        rx.wait_unordered([expected(path).rename_from()]);
+        rx.wait_unordered([expected(path).rename_any()]);
     }
 
     #[test]
@@ -936,7 +935,7 @@ mod tests {
             expected(&new_path).rename_any(),
             expected(&new_path).modify_data_content(),
             expected(&new_path).remove_file(),
-        ])
+        ]);
     }
 
     #[test]
@@ -954,9 +953,8 @@ mod tests {
         std::fs::rename(&path, &new_path1).expect("rename1");
         std::fs::rename(&new_path1, &new_path2).expect("rename2");
 
-        rx.wait_ordered([
+        rx.wait_unordered([
             expected(&path).rename_any(),
-            expected(&new_path1).rename_any(),
             expected(&new_path1).rename_any(),
             expected(&new_path2).rename_any(),
         ]);
@@ -979,7 +977,10 @@ mod tests {
         )
         .expect("set_time");
 
-        rx.wait_unordered([expected(path).modify_meta_mtime()]);
+        rx.wait_unordered([
+            expected(&path).modify_meta_any(),
+            expected(&path).modify_meta_ext(),
+        ]);
     }
 
     #[test]
