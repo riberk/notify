@@ -162,7 +162,7 @@
 
 #![deny(missing_docs)]
 
-pub use config::{Config, PathOp, RecursiveMode, WatchPathConfig};
+pub use config::{Config, PathOp, RecursiveMode, WatchFilter, WatchPathConfig, WatchPathFilter};
 pub use error::{Error, ErrorKind, Result, UpdatePathsError};
 pub use notify_types::event::{self, Event, EventKind, EventKindMask};
 use std::path::Path;

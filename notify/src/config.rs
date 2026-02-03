@@ -2,6 +2,7 @@
 
 use notify_types::event::EventKindMask;
 use std::{
+    fmt::Debug,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -174,18 +175,52 @@ impl Default for Config {
 /// such as to correctly configure each backend regardless of what is selected during runtime.
 #[derive(Debug)]
 pub struct WatchPathConfig {
-    recursive_mode: RecursiveMode,
+    pub(crate) recursive_mode: RecursiveMode,
+    pub(crate) watch_filter: WatchFilter,
 }
 
 impl WatchPathConfig {
     /// Creates new instance with provided [`RecursiveMode`]
     pub fn new(recursive_mode: RecursiveMode) -> Self {
-        Self { recursive_mode }
+        Self {
+            recursive_mode,
+            watch_filter: Default::default(),
+        }
     }
 
     /// Set [`RecursiveMode`] for the watch
     pub fn with_recursive_mode(mut self, recursive_mode: RecursiveMode) -> Self {
         self.recursive_mode = recursive_mode;
+        self
+    }
+
+    /// Sets a [`WatchPathFilter`] used to decide which paths should be
+    /// registered for watching when watches are added implicitly.
+    ///
+    /// The filter is evaluated when new paths are added in recursive mode.
+    /// Returning `false` prevents the corresponding path from being watched.
+    ///
+    /// This is primarily useful for the `inotify` backend, where recursive
+    /// watching is implemented by registering every subdirectory and
+    /// iterating over directory entries.
+    /// Using a filter allows limiting watch growth (e.g. skipping `.git`,
+    /// `target`, temporary directories, etc.).
+    ///
+    /// # Important
+    ///
+    /// This filters *watches*, not *events*.
+    ///
+    /// On fully recursive backends such as macOS `FSEvents` and Windows
+    /// `ReadDirectoryChangesW`, this has no effect because those backends
+    /// do not register individual subdirectory watches.
+    ///
+    /// This also has no effect if watches are added explicitly via
+    /// [`crate::Watcher::watch`] or [`crate::Watcher::update_paths`].
+    pub fn with_implicit_watches_filter(
+        mut self,
+        filter: impl WatchPathFilter + Send + 'static,
+    ) -> Self {
+        self.watch_filter = WatchFilter::new(filter);
         self
     }
 
@@ -240,6 +275,123 @@ impl PathOp {
             PathOp::Watch(p, _) => p,
             PathOp::Unwatch(p) => p,
         }
+    }
+}
+
+/// A predicate used to decide whether a path should be watched.
+///
+/// Implementations can provide custom logic to include or exclude paths
+/// during watch registration (for example, to skip certain directories
+/// or temporary files).
+///
+/// The filter is stateful (`&mut self`) to allow implementations to
+/// maintain internal caches or counters if necessary.
+pub trait WatchPathFilter {
+    /// Returns whether the given `path` should be watched.
+    ///
+    /// This method may be called multiple times during recursive watch
+    /// traversal or when new filesystem entries appear.
+    ///
+    /// Returning `true` means the path should be watched.
+    /// Returning `false` means the path should be skipped.
+    fn should_watch(&mut self, path: &Path) -> bool;
+}
+
+/// An optional, dynamically-dispatched [`WatchPathFilter`].
+///
+/// `WatchFilter` is a lightweight wrapper around
+/// `Option<Box<dyn WatchPathFilter>>` that provides a convenient way
+/// to configure path filtering without exposing trait objects directly.
+///
+/// By default, no filter is installed, meaning all paths are allowed.
+#[derive(Default)]
+pub struct WatchFilter(Option<Box<dyn WatchPathFilter + Send + 'static>>);
+
+impl Debug for WatchFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("WatchFilter")
+            .field(match &self.0 {
+                Some(_) => &"Some(...)",
+                None => &"None",
+            })
+            .finish()
+    }
+}
+
+impl WatchFilter {
+    /// Creates a `WatchFilter` with no filtering.
+    ///
+    /// All paths will be considered allowed.
+    ///
+    /// This is equivalent to [`Default::default`].
+    pub const fn none() -> Self {
+        Self(None)
+    }
+
+    /// Creates a `WatchFilter` from the given filter implementation.
+    ///
+    /// The provided filter must be `Send` and `'static` since it may be
+    /// stored inside a watcher that runs on a background thread.
+    ///
+    /// # Example
+    ///
+    /// ### Using a closure (`FnMut`):
+    /// ```
+    /// # use std::path::Path;
+    /// # use notify::{WatchFilter, WatchPathFilter};
+    ///
+    /// let mut counter = 0usize;
+    /// let mut filter = WatchFilter::new(move |_: &Path| {
+    ///     if counter >= 2 {
+    ///         false
+    ///     } else {
+    ///         counter += 1;
+    ///         true
+    ///     }
+    /// });
+    ///
+    /// assert!(filter.as_filter_mut().is_some_and(|filter| filter.should_watch(Path::new("1"))));
+    /// assert!(filter.as_filter_mut().is_some_and(|filter| filter.should_watch(Path::new("1"))));
+    /// assert!(!filter.as_filter_mut().is_some_and(|filter| filter.should_watch(Path::new("1"))));
+    /// ```
+    ///
+    /// ### Using a custom type
+    /// ```
+    /// # use std::path::Path;
+    /// # use notify::{WatchFilter, WatchPathFilter};
+    /// struct SkipGitDir;
+    ///
+    /// impl WatchPathFilter for SkipGitDir {
+    ///     fn should_watch(&mut self, path: &Path) -> bool {
+    ///         !path.ends_with(".git")
+    ///     }
+    /// }
+    ///
+    /// let mut filter = WatchFilter::new(SkipGitDir);
+    /// assert!(!filter.as_filter_mut().is_some_and(|filter| filter.should_watch(Path::new("parent/.git"))));
+    /// assert!(filter.as_filter_mut().is_some_and(|filter| filter.should_watch(Path::new("parent/README"))));
+    /// ```
+    pub fn new(filter: impl WatchPathFilter + Send + 'static) -> Self {
+        Self(Some(Box::new(filter)))
+    }
+
+    /// Returns a mutable reference to the underlying filter, if present.
+    pub fn as_filter_mut(&mut self) -> Option<&mut (dyn WatchPathFilter + Send + 'static)> {
+        self.0.as_deref_mut()
+    }
+
+    /// Consumes the `WatchFilter` and returns the underlying boxed filter.
+    pub fn into_filter(self) -> Option<Box<(dyn WatchPathFilter + Send + 'static)>> {
+        self.0
+    }
+}
+
+impl<F> WatchPathFilter for F
+where
+    F: FnMut(&Path) -> bool,
+{
+    fn should_watch(&mut self, path: &Path) -> bool {
+        self(path)
     }
 }
 
